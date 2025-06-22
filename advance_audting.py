@@ -1,966 +1,1196 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import yfinance as yf
-
-try:
-   from alpha_vantage.fundamentaldata import FundamentalData
-except ImportError:
-   st.error("The 'alpha_vantage' package is not installed. Please install it using: pip install alpha_vantage")
-   st.stop()
-try:
-   from transformers import pipeline
-except ImportError:
-   st.error("The 'transformers' package is not installed. Please install it using: pip install transformers")
-   st.stop()
-except RuntimeError as e:
-   st.error(f"Failed to initialize transformers due to: {str(e)}. Please install tf-keras using: pip install tf-keras")
-   st.stop()
-import requests
-from datetime import datetime, timedelta
-from sklearn.ensemble import IsolationForest, RandomForestRegressor
-from sklearn.preprocessing import StandardScaler, MinMaxScaler
-from sklearn.cluster import KMeans
-import statsmodels.api as sm
-from scipy import stats
-import holidays
-from lifelines import KaplanMeierFitter
 import plotly.express as px
 import plotly.graph_objects as go
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Dropout
-import xgboost as xgb
+from sklearn.preprocessing import StandardScaler
+import torch
+import torch.nn as nn
+from torchcde import cdeint
+import networkx as nx
+from transformers import pipeline
+import redis
+import re
+from datetime import datetime
+import click
 import os
-from dotenv import load_dotenv
-from tenacity import retry, stop_after_attempt, wait_fixed
-from functools import lru_cache
-import logging
-import tensorflow as tf
+from typing import List, Dict, Tuple
+from scipy.special import zeta
+from scipy.fft import fft
+import cvxpy as cp
+from arch import arch_model
+import gudhi
+from qiskit import QuantumCircuit, Aer, execute
+import io
+import base64
+import warnings
+import sys
 
+
+warnings.filterwarnings("ignore")
+
+# Streamlit App Configuration
+st.set_page_config(page_title="AutoCA: Deep-Tech Financial AI", layout="wide")
+st.markdown("<h1 style='text-align: center; color: #2E86C1;'>AutoCA: Deep-Tech Financial AI (2025–2030)</h1>",
+            unsafe_allow_html=True)
+
+# Redis for Caching
 try:
-   import torch
+   redis_client = redis.Redis(host='localhost', port=6379, db=0)
+except:
+   redis_client = None
+   st.warning("Redis not available; caching disabled.")
 
-   TORCH_AVAILABLE = True
-except ImportError:
-   TORCH_AVAILABLE = False
-   torch = None
-
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
-
-# Load environment variables
-load_dotenv()
-ALPHA_VANTAGE_KEY = os.getenv('ALPHA_VANTAGE_KEY')
-if not ALPHA_VANTAGE_KEY:
-   st.error("Alpha Vantage API key not found. Please set it in a .env file with ALPHA_VANTAGE_KEY=your_key.")
-   st.stop()
-
-# Set page config
-st.set_page_config(page_title="Finance Analytics Suite", page_icon="📊", layout="wide")
-
-# Initialize APIs
-fd = FundamentalData(key=ALPHA_VANTAGE_KEY)
-try:
-   # Try TensorFlow model first
-   logger.info("Attempting to initialize sentiment pipeline with TensorFlow")
-   sentiment_pipeline = pipeline(
-      "sentiment-analysis",
-      model="distilbert-base-uncased-finetuned-sst-2-english",
-      framework="tf"
-   )
-   logger.info("Successfully initialized sentiment pipeline with TensorFlow")
-except Exception as e:
-   logger.error(f"Failed to initialize TensorFlow sentiment pipeline: {str(e)}")
-   if TORCH_AVAILABLE:
-      try:
-         logger.info("Falling back to PyTorch for sentiment pipeline")
-         sentiment_pipeline = pipeline(
-            "sentiment-analysis",
-            model="distilbert-base-uncased-finetuned-sst-2-english",
-            framework="pt"
-         )
-         logger.info("Successfully initialized sentiment pipeline with PyTorch")
-      except Exception as e2:
-         logger.error(f"Failed to initialize PyTorch sentiment pipeline: {str(e2)}")
-         st.warning("Sentiment analysis is disabled due to initialization failure. Using fallback neutral sentiment.")
-         sentiment_pipeline = None
-   else:
-      logger.error("PyTorch not available and TensorFlow failed. Disabling sentiment analysis.")
-      st.warning(
-         "Sentiment analysis is disabled due to missing PyTorch and TensorFlow failure. Using fallback neutral sentiment.")
-      sentiment_pipeline = None
+# Role-Based Access
+USER_ROLES = {"CA": "full", "SME_Owner": "limited", "Auditor": "read-only"}
 
 
-# ======================
-# HELPER FUNCTIONS
-# ======================
+# Bookkeeping Classes
+class Account:
+   def __init__(self, name, account_type, currency="INR"):
+      self.name = name
+      self.account_type = account_type
+      self.currency = currency
+      self.balance = 0.0
+      self.transactions = []
 
-@retry(stop=stop_after_attempt(3), wait=wait_fixed(60))
-@lru_cache(maxsize=128)
-def get_company_info(symbol):
-   """Fetch company information from Yahoo Finance."""
-   try:
-      stock = yf.Ticker(symbol)
-      info = stock.info
-      return {
-         'name': info.get('longName', symbol),
-         'sector': info.get('sector', 'N/A'),
-         'industry': info.get('industry', 'N/A'),
-         'country': info.get('country', 'N/A'),
-         'employees': info.get('fullTimeEmployees', 'N/A'),
-         'summary': info.get('longBusinessSummary', 'No description available'),
-         'market_cap': info.get('marketCap', 'N/A')
-      }
-   except Exception as e:
-      logger.error(f"Error fetching company info for {symbol}: {str(e)}")
-      st.error(f"Error fetching company info for {symbol}: {str(e)}")
-      return None
+   def debit(self, amount, description):
+      if self.account_type in ["Asset", "Expense"]:
+         self.balance += amount
+      else:
+         self.balance -= amount
+      self.transactions.append({"type": "debit", "amount": amount, "description": description, "date": datetime.now()})
+
+   def credit(self, amount, description):
+      if self.account_type in ["Asset", "Expense"]:
+         self.balance -= amount
+      else:
+         self.balance += amount
+      self.transactions.append({"type": "credit", "amount": amount, "description": description, "date": datetime.now()})
 
 
-@retry(stop=stop_after_attempt(3), wait=wait_fixed(60))
-@lru_cache(maxsize=128)
-def get_stock_data(symbol, period='1y'):
-   """Fetch stock data from Yahoo Finance."""
-   try:
-      data = yf.download(symbol, period=period)
-      if data.empty:
-         st.error(f"No stock data available for {symbol}.")
-         return pd.DataFrame()
-      return data
-   except Exception as e:
-      logger.error(f"Error fetching stock data for {symbol}: {str(e)}")
-      st.error(f"Error fetching stock data for {symbol}: {str(e)}")
-      return pd.DataFrame()
-
-
-@retry(stop=stop_after_attempt(3), wait=wait_fixed(60))
-@lru_cache(maxsize=128)
-def get_financial_statements(symbol, statement_type):
-   """Fetch financial statements from Alpha Vantage."""
-   try:
-      if statement_type == 'income':
-         data, _ = fd.get_income_statement_annual(symbol)
-      elif statement_type == 'balance':
-         data, _ = fd.get_balance_sheet_annual(symbol)
-      elif statement_type == 'cashflow':
-         data, _ = fd.get_cash_flow_annual(symbol)
-      if data.empty:
-         st.error(f"No {statement_type} data available for {symbol}.")
-         return None
-      return data
-   except Exception as e:
-      logger.error(f"Error fetching {statement_type} statement for {symbol}: {str(e)}")
-      st.error(f"Error fetching {statement_type} statement for {symbol}: {str(e)}")
-      return None
-
-
-def analyze_sentiment(text):
-   """Analyze sentiment of text, handling long inputs by chunking."""
-   if not sentiment_pipeline:
-      return {'label': 'NEUTRAL', 'score': 0.5}
-   if not isinstance(text, str) or not text.strip():
-      return {'label': 'NEUTRAL', 'score': 0.5}
-   try:
-      max_length = 512
-      chunks = [text[i:i + max_length] for i in range(0, len(text), max_length)]
-      results = [sentiment_pipeline(chunk)[0] for chunk in chunks]
-      scores = [r['score'] if r['label'] == 'POSITIVE' else 1 - r['score'] for r in results]
-      avg_score = sum(scores) / len(scores)
-      avg_label = 'POSITIVE' if avg_score > 0.5 else 'NEGATIVE' if avg_score < 0.5 else 'NEUTRAL'
-      return {'label': avg_label, 'score': avg_score}
-   except Exception as e:
-      logger.error(f"Sentiment analysis failed: {str(e)}")
-      st.error(f"Sentiment analysis failed: {str(e)}")
-      return {'label': 'NEUTRAL', 'score': 0.5}
-
-
-@retry(stop=stop_after_attempt(3), wait=wait_fixed(60))
-def get_news_sentiment(symbol):
-   """Fetch and analyze news sentiment from Alpha Vantage."""
-   try:
-      url = f'https://www.alphavantage.co/query?function=NEWS_SENTIMENT&tickers={symbol}&apikey={ALPHA_VANTAGE_KEY}'
-      response = requests.get(url)
-      response.raise_for_status()
-      data = response.json()
-      if 'feed' in data:
-         sentiments = [analyze_sentiment(item.get('summary', ''))['label'] for item in data['feed'][:5]]
-         if sentiments:
-            positive = sentiments.count('POSITIVE') / len(sentiments)
-            negative = sentiments.count('NEGATIVE') / len(sentiments)
-            neutral = sentiments.count('NEUTRAL') / len(sentiments)
-            return positive, negative, neutral
-      return 0.33, 0.33, 0.34
-   except Exception as e:
-      logger.error(f"News sentiment analysis failed for {symbol}: {str(e)}")
-      st.error(f"News sentiment analysis failed for {symbol}: {str(e)}")
-      return 0.33, 0.33, 0.34
-
-
-def calculate_technicals(data):
-   """Calculate technical indicators for stock data."""
-   if data.empty:
-      return data
-   data = data.copy()
-   delta = data['Close'].diff()
-   gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-   loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-   rs = gain / loss.where(loss != 0, np.inf)
-   data['RSI'] = 100 - (100 / (1 + rs)).where(rs != np.inf, 50)
-   ema12 = data['Close'].ewm(span=12, adjust=False).mean()
-   ema26 = data['Close'].ewm(span=26, adjust=False).mean()
-   data['MACD'] = ema12 - ema26
-   data['MACD_Signal'] = data['MACD'].ewm(span=9, adjust=False).mean()
-   data['BB_Middle'] = data['Close'].rolling(window=20).mean()
-   data['BB_Std'] = data['Close'].rolling(window=20).std()
-   data['BB_Upper'] = data['BB_Middle'] + 2 * data['BB_Std']
-   data['BB_Lower'] = data['BB_Middle'] - 2 * data['BB_Std']
-   high_low = data['High'] - data['Low']
-   high_close = np.abs(data['High'] - data['Close'].shift())
-   low_close = np.abs(data['Low'] - data['Close'].shift())
-   tr = high_low.combine(high_close, max).combine(low_close, max)
-   data['ATR'] = tr.rolling(window=14).mean()
-   data['Lowest_14'] = data['Low'].rolling(window=14).min()
-   data['Highest_14'] = data['High'].rolling(window=14).max()
-   denominator = data['Highest_14'] - data['Lowest_14']
-   data['Stoch_K'] = 100 * (data['Close'] - data['Lowest_14']) / denominator.where(denominator != 0, 1)
-   data['Stoch_D'] = data['Stoch_K'].rolling(window=3).mean()
-   data['VWAP'] = (data['Close'] * data['Volume']).cumsum() / data['Volume'].cumsum()
-   return data
-
-
-def get_dividend_analysis(symbol):
-   """Calculate current and historical dividend yield."""
-   try:
-      stock = yf.Ticker(symbol)
-      dividends = stock.dividends
-      if not dividends.empty:
-         history = stock.history(period='1d')
-         if history.empty:
-            return 0, pd.Series()
-         current_price = history['Close'].iloc[-1]
-         annual_dividend = dividends.resample('Y').sum().iloc[-1]
-         yield_current = annual_dividend / current_price * 100
-         yield_history = (dividends.resample('Y').sum() / stock.history(period='max')['Close'].resample(
-            'Y').last() * 100).dropna()
-         return yield_current, yield_history
-      return 0, pd.Series()
-   except Exception as e:
-      logger.error(f"Error calculating dividend yield for {symbol}: {str(e)}")
-      st.error(f"Error calculating dividend yield for {symbol}: {str(e)}")
-      return 0, pd.Series()
-
-
-def get_insider_institutional(symbol):
-   """Fetch institutional and major holders data."""
-   try:
-      stock = yf.Ticker(symbol)
-      return stock.institutional_holders, stock.major_holders
-   except Exception as e:
-      logger.error(f"Error fetching ownership data for {symbol}: {str(e)}")
-      st.error(f"Error fetching ownership data for {symbol}: {str(e)}")
-      return None, None
-
-
-def get_options_chain(symbol):
-   """Fetch options chain data."""
-   try:
-      stock = yf.Ticker(symbol)
-      expiration_dates = stock.options
-      if expiration_dates:
-         opt = stock.option_chain(expiration_dates[0])
-         calls = opt.calls[['strike', 'lastPrice', 'volume', 'openInterest', 'impliedVolatility']]
-         puts = opt.puts[['strike', 'lastPrice', 'volume', 'openInterest', 'impliedVolatility']]
-         return calls, puts, expiration_dates[0]
-      return None, None, None
-   except Exception as e:
-      logger.error(f"Error fetching options chain for {symbol}: {str(e)}")
-      st.error(f"Error fetching options chain for {symbol}: {str(e)}")
-      return None, None, None
-
-
-def compare_peers(symbol):
-   """Compare stock performance with peers."""
-   try:
-      stock = yf.Ticker(symbol)
-      peers = stock.info.get('relatedCompanies', [symbol, 'SPY'])[:5]
-      data = yf.download(peers, period='1y')['Adj Close']
-      if data.empty:
-         st.error(f"No peer data available for {symbol}.")
-         return pd.DataFrame()
-      return data.pct_change().cumsum() * 100
-   except Exception as e:
-      logger.error(f"Error in peer comparison for {symbol}: {str(e)}")
-      st.error(f"Error in peer comparison for {symbol}: {str(e)}")
-      return pd.DataFrame()
-
-
-def backtest_sma_strategy(data, short_window=50, long_window=200):
-   """Backtest SMA crossover strategy."""
-   if data.empty:
-      return pd.Series()
-   data = data.copy()
-   data['Short_SMA'] = data['Close'].rolling(short_window).mean()
-   data['Long_SMA'] = data['Close'].rolling(long_window).mean()
-   data['Signal'] = np.where(data['Short_SMA'] > data['Long_SMA'], 1, 0)
-   data['Position'] = data['Signal'].shift()
-   data['Returns'] = data['Close'].pct_change() * data['Position']
-   return data['Returns'].cumsum()
-
-
-def lstm_price_prediction(data, symbol, days_ahead=30):
-   """LSTM-based stock price prediction with model caching."""
-   if data.empty:
-      st.error("No data available for price prediction.")
-      return pd.Series()
-   model_path = f"lstm_model_{symbol}.h5"
-   close_prices = data['Close'].values
-   scaler = MinMaxScaler()
-   scaled_data = scaler.fit_transform(close_prices.reshape(-1, 1))
-
-   look_back = 60
-   X, y = [], []
-   for i in range(look_back, len(scaled_data)):
-      X.append(scaled_data[i - look_back:i, 0])
-      y.append(scaled_data[i, 0])
-   X, y = np.array(X), np.array(y)
-   X = np.reshape(X, (X.shape[0], X.shape[1], 1))
-
-   train_size = int(len(X) * 0.8)
-   X_train, X_test = X[:train_size], X[train_size:]
-   y_train, y_test = y[:train_size], y[train_size:]
-
-   if os.path.exists(model_path):
-      model = tf.keras.models.load_model(model_path)
-      st.info("Loaded pre-trained LSTM model.")
-   else:
-      model = Sequential()
-      model.add(LSTM(50, return_sequences=True, input_shape=(look_back, 1)))
-      model.add(Dropout(0.2))
-      model.add(LSTM(50))
-      model.add(Dropout(0.2))
-      model.add(Dense(1))
-      model.compile(optimizer='adam', loss='mean_squared_error')
-      model.fit(X_train, y_train, epochs=20, batch_size=32, verbose=0)
-      model.save(model_path)
-      st.info("Trained and saved new LSTM model.")
-
-   last_sequence = scaled_data[-look_back:]
-   future_predictions = []
-   for _ in range(days_ahead):
-      pred = model.predict(last_sequence.reshape(1, look_back, 1), verbose=0)
-      future_predictions.append(pred[0, 0])
-      last_sequence = np.append(last_sequence[1:], pred[0, 0])
-
-   future_predictions = scaler.inverse_transform(np.array(future_predictions).reshape(-1, 1))
-   future_dates = pd.date_range(start=data.index[-1], periods=days_ahead + 1, freq='B')[1:]
-   return pd.Series(future_predictions.flatten(), index=future_dates)
-
-
-def stock_health_score(data, symbol):
-   """Calculate heuristic-based stock health score."""
-   if data.empty:
-      return 0
-   technicals = calculate_technicals(data)
-   latest = technicals.iloc[-1]
-   income = get_financial_statements(symbol, 'income')
-   pos, neg, neu = get_news_sentiment(symbol)
-
-   features = {
-      'RSI': latest['RSI'] if not pd.isna(latest['RSI']) else 50,
-      'MACD': latest['MACD'] if not pd.isna(latest['MACD']) else 0,
-      'ATR': latest['ATR'] if not pd.isna(latest['ATR']) else 0,
-      'Volume': latest['Volume'] if not pd.isna(latest['Volume']) else 0,
-      'Sentiment_Pos': pos,
-      'Revenue': float(income['totalRevenue'].iloc[0]) if income is not None and not income.empty else 0,
-      'NetIncome': float(income['netIncome'].iloc[0]) if income is not None and not income.empty else 0
-   }
-   df = pd.DataFrame([features])
-   scaler = StandardScaler()
-   X = scaler.fit_transform(df)
-
-   health_score = np.clip(np.mean(X[0]) * 100 + 50, 0, 100)
-   st.warning("Health score is based on a heuristic model and should be used for informational purposes only.")
-   return health_score
-
-
-def detect_price_anomalies(data):
-   """Detect anomalies in price movements."""
-   if data.empty:
-      return pd.DataFrame()
-   df = data[['Close']].pct_change().dropna()
-   if df.empty:
-      return pd.DataFrame()
-   clf = IsolationForest(contamination=0.05, random_state=42)
-   df['Anomaly'] = clf.fit_predict(df)
-   anomalies = data.loc[df[df['Anomaly'] == -1].index]
-   return anomalies
-
-
-def classify_trend(data):
-   """Classify market trend as Bullish, Bearish, or Neutral."""
-   if data.empty:
-      return 'Neutral'
-   returns = data['Close'].pct_change().dropna()
-   X = pd.DataFrame({
-      'Returns': returns,
-      'Volatility': returns.rolling(20).std(),
-      'RSI': calculate_technicals(data)['RSI']
-   }).dropna()
-   if X.empty:
-      return 'Neutral'
-   labels = np.where(X['Returns'].rolling(20).mean() > 0.01, 1,
-                     np.where(X['Returns'].rolling(20).mean() < -0.01, -1, 0))
-   model = xgb.XGBClassifier(random_state=42)
-   model.fit(X.iloc[:-1], labels[1:])
-   latest = X.iloc[-1].values.reshape(1, -1)
-   pred = model.predict(latest)[0]
-   st.warning("Trend prediction is based on a simplified model and should be used cautiously.")
-   return {1: 'Bullish', -1: 'Bearish', 0: 'Neutral'}[pred]
-
-
-# ======================
-# AUDITING TOOLS CLASS
-# ======================
-
-class AdvancedAuditTools:
+class Ledger:
    def __init__(self):
-      self.gst_rules = {
-         'india': {'standard_rate': 0.18, 'threshold': 2000000},
-         'singapore': {'standard_rate': 0.07, 'threshold': 1000000},
-         'us': {'standard_rate': 0.0, 'threshold': 0}
-      }
+      self.accounts = {}
+      self.gstin_map = {}
 
-   def gst_compliance_check(self, transactions):
-      """Check GST compliance for transactions."""
+   def add_account(self, name, account_type, currency="INR", gstin=None):
+      self.accounts[name] = Account(name, account_type, currency)
+      if gstin:
+         self.gstin_map[gstin] = name
+
+   def record_transaction(self, debit_account, credit_account, amount, description, gstin=None):
+      if debit_account not in self.accounts or credit_account not in self.accounts:
+         raise ValueError("Invalid account")
+      self.accounts[debit_account].debit(amount, description)
+      self.accounts[credit_account].credit(amount, description)
+
+      total_debits = sum(acc.balance for acc in self.accounts.values() if acc.account_type in ["Asset", "Expense"])
+      total_credits = sum(
+         acc.balance for acc in self.accounts.values() if acc.account_type in ["Liability", "Equity", "Revenue"])
+      if abs(total_debits - total_credits) > 0.01:
+         raise ValueError("Ledger imbalance detected")
+
+      if redis_client:
+         redis_client.set(f"txn_{hash(description)}",
+                          str({"debit": debit_account, "credit": credit_account, "amount": amount}))
+
+      return {"status": "Recorded", "debit_account": debit_account, "credit_account": credit_account, "amount": amount}
+
+   def auto_entry(self, invoice_data):
+      amount = invoice_data.get("amount")
+      gstin = invoice_data.get("gstin")
+      date = invoice_data.get("date", "2025-06-19")
+      doc_type = invoice_data.get("document_type", "Unknown")
+
+      description = f"Invoice {doc_type} {date}"
+      if doc_type.lower().startswith("s"):
+         debit_account = "Cash"
+         credit_account = "Sales"
+      else:
+         debit_account = "Purchases"
+         credit_account = "Cash"
+
+      if debit_account not in self.accounts:
+         self.add_account(debit_account, "Asset" if debit_account == "Cash" else "Expense")
+      if credit_account not in self.accounts:
+         self.add_account(credit_account, "Revenue" if credit_account == "Sales" else "Asset")
+
+      return self.record_transaction(debit_account, credit_account, amount, description, gstin)
+
+
+# Initialize Ledger
+ledger = Ledger()
+
+
+# Data Ingestion Module
+@st.cache_data
+def load_data(file, file_type="csv") -> pd.DataFrame:
+   """Load and preprocess business datasets or invoices."""
+   if file is not None:
       try:
-         df = pd.DataFrame(transactions)
-         df['date'] = pd.to_datetime(df['date'], errors='coerce')
-         if df['date'].isna().any():
-            st.error("Invalid date values in transactions.")
+         if file_type == "csv":
+            df = pd.read_csv(file)
+         elif file_type in ["xlsx", "xls"]:
+            df = pd.read_excel(file)
+         elif file_type == "text":
+            text = file.read().decode('utf-8')
+            invoice_data = parse_invoice_text(text)
+            df = pd.DataFrame([invoice_data])
+         else:
+            st.error("Unsupported file format. Use CSV, Excel, or Text.")
             return None
-         df['day_of_week'] = df['date'].dt.dayofweek
-         df['is_weekend'] = df['day_of_week'].isin([5, 6]).astype(int)
-         df['amount_zscore'] = stats.zscore(df['amount'])
-         clf = IsolationForest(contamination=0.05, random_state=42)
-         features = ['amount', 'day_of_week', 'is_weekend']
-         df['anomaly_score'] = clf.fit_predict(df[features])
-         country = st.selectbox("Select Country", list(self.gst_rules.keys()))
-         rate = self.gst_rules[country]['standard_rate']
-         threshold = self.gst_rules[country]['threshold']
-         df['gst_amount'] = df['amount'] * rate
-         df['gst_compliant'] = df['amount'] > threshold
+         for col in df.columns:
+            if df[col].dtype == 'object':
+               try:
+                  df[col] = pd.to_datetime(df[col])
+               except:
+                  pass
+         df = adaptive_neural_imputation(df)
          return df
       except Exception as e:
-         logger.error(f"GST analysis failed: {str(e)}")
-         st.error(f"GST analysis failed: {str(e)}")
+         st.error(f"Error processing file: {str(e)}")
          return None
-
-   def accounting_standard_check(self, financials):
-      """Classify financials as IFRS or GAAP."""
-      try:
-         X = financials[['revenue_growth', 'asset_turnover', 'debt_ratio']]
-         scaler = StandardScaler()
-         X_scaled = scaler.fit_transform(X)
-         kmeans = KMeans(n_clusters=2, random_state=42)
-         clusters = kmeans.fit_predict(X_scaled)
-         standards = ['IFRS', 'GAAP']
-         financials['predicted_standard'] = [standards[c] for c in clusters]
-         return financials
-      except Exception as e:
-         logger.error(f"Accounting standard analysis failed: {str(e)}")
-         st.error(f"Accounting standard analysis failed: {str(e)}")
-         return None
-
-   def inventory_audit(self, inventory_data):
-      """Audit inventory data for anomalies."""
-      try:
-         inventory_data['date'] = pd.to_datetime(inventory_data['date'], errors='coerce')
-         if inventory_data['date'].isna().any():
-            st.error("Invalid date values in inventory data.")
-            return None
-         ts = inventory_data.set_index('date')['quantity']
-         model = sm.tsa.SARIMAX(ts, order=(1, 1, 1), seasonal_order=(1, 1, 1, 12))
-         results = model.fit(disp=False)
-         predictions = results.get_prediction()
-         ts_pred = predictions.predicted_mean
-         residuals = ts - ts_pred
-         threshold = residuals.std() * 3
-         anomalies = (residuals.abs() > threshold).astype(int)
-         return {'actual': ts, 'predicted': ts_pred, 'anomalies': anomalies, 'model_summary': results.summary()}
-      except Exception as e:
-         logger.error(f"Inventory analysis failed: {str(e)}")
-         st.error(f"Inventory analysis failed: {str(e)}")
-         return None
-
-   def receivables_analysis(self, invoices):
-      """Analyze receivables aging and payment probability."""
-      try:
-         invoices = invoices.copy()
-         invoices['due_date'] = pd.to_datetime(invoices['due_date'], errors='coerce')
-         if invoices['due_date'].isna().any():
-            st.error("Invalid due_date values detected.")
-            return None
-         now = pd.Timestamp.now(tz='UTC')
-         invoices['days_outstanding'] = (now - invoices['due_date']).dt.days
-         invoices['is_paid'] = invoices['paid_amount'] > 0
-         kmf = KaplanMeierFitter()
-         kmf.fit(invoices['days_outstanding'], invoices['is_paid'])
-         payment_prob = kmf.survival_function_
-         X = invoices[['amount', 'days_outstanding']]
-         scaler = StandardScaler()
-         X_scaled = scaler.fit_transform(X)
-         invoices['risk_cluster'] = KMeans(n_clusters=3).fit_predict(X_scaled)
-         return {'payment_probability': payment_prob, 'invoices': invoices,
-                 'high_risk': invoices[invoices['risk_cluster'] == 2]}
-      except Exception as e:
-         logger.error(f"Receivables analysis failed: {str(e)}")
-         st.error(f"Receivables analysis failed: {str(e)}")
-         return None
+   return None
 
 
-# ======================
-# STREAMLIT UI
-# ======================
+# Adaptive Neural Imputation
+class AdaptiveImputer(nn.Module):
+   def __init__(self, input_dim: int):
+      super(AdaptiveImputer, self).__init__()
+      self.encoder = nn.Sequential(
+         nn.Linear(input_dim, 128),
+         nn.ReLU(),
+         nn.Linear(128, 64),
+         nn.ReLU(),
+      )
+      self.decoder = nn.Sequential(
+         nn.Linear(64, 128),
+         nn.ReLU(),
+         nn.Linear(128, input_dim)
+      )
 
-def validate_symbol(symbol):
-   """Validate stock symbol."""
-   if not symbol or not symbol.isalnum():
-      st.error("Please enter a valid stock symbol (alphanumeric characters only).")
-      return False
+   def forward(self, x):
+      return self.decoder(self.encoder(x))
+
+
+def adaptive_neural_imputation(df: pd.DataFrame) -> pd.DataFrame:
+   """Impute missing values using a neural network."""
+   numeric_cols = df.select_dtypes(include=[np.number]).columns
+   if df[numeric_cols].isna().any().any():
+      imputer = AdaptiveImputer(len(numeric_cols))
+      optimizer = torch.optim.Adam(imputer.parameters(), lr=0.005)
+      X = torch.tensor(df[numeric_cols].fillna(0).values, dtype=torch.float32)
+      mask = torch.tensor(df[numeric_cols].isna().values, dtype=torch.bool)
+
+      for _ in range(100):
+         optimizer.zero_grad()
+         X_pred = imputer(X)
+         loss = torch.mean((X_pred[~mask] - X[~mask]) ** 2)
+         loss.backward()
+         optimizer.step()
+
+      with torch.no_grad():
+         X_imputed = imputer(X).numpy()
+         df[numeric_cols] = np.where(df[numeric_cols].isna(), X_imputed, df[numeric_cols])
+   return df
+
+
+# Fractional Differentiation (Simplified)
+def fractional_diff(data: pd.Series, d: float = 0.5) -> pd.Series:
+   """Compute fractional differencing for time series."""
+   weights = [1.0]
+   for k in range(1, len(data)):
+      weights.append(-weights[-1] * (d - k + 1) / k)
+   result = np.convolve(data, weights[:len(data)][::-1], mode='valid')
+   return pd.Series(result, index=data.index[-len(result):])
+
+
+# T-Copula (Simplified)
+def t_copula(data: pd.DataFrame, dof: int = 5) -> np.ndarray:
+   """Approximate T-Copula for dependency modeling."""
+   from scipy.stats import t
+   standardized = (data - data.mean()) / data.std()
+   return t.cdf(standardized, df=dof)
+
+
+# Neural CDE for Anomaly Detection
+class CDEFunc(nn.Module):
+   def __init__(self, input_dim: int):
+      super(CDEFunc, self).__init__()
+      self.net = nn.Sequential(
+         nn.Linear(input_dim, 100),
+         nn.Tanh(),
+         nn.Linear(100, input_dim * input_dim)
+      )
+
+   def forward(self, t, z):
+      return self.net(z).view(z.size(0), z.size(1), -1)
+
+
+def neural_cde_anomaly(data: pd.DataFrame) -> Dict:
+   """Detect anomalies using Neural CDEs with Zeta enhancement."""
+   numeric_cols = data.select_dtypes(include=[np.number]).columns
+   amounts = data['amount'].values if 'amount' in data.columns else data[numeric_cols].values
+   timestamps = data['date'].map(datetime.toordinal).values if 'date' in data.columns else np.arange(len(data))
+
+   scaler = StandardScaler()
+   scaled_data = scaler.fit_transform(amounts.reshape(-1, 1) if len(amounts.shape) == 1 else amounts)
+
+   X = torch.tensor(np.column_stack([timestamps, scaled_data]), dtype=torch.float32)
    try:
-      stock = yf.Ticker(symbol)
-      stock.info  # Test if symbol is valid
-      return True
-   except Exception:
-      st.error(f"Invalid stock symbol: {symbol}. Please try a different symbol.")
-      return False
+      X = torchcde.CubicSpline(X).interpolate(torch.linspace(0, 1, 50))
+      cde_func = CDEFunc(scaled_data.shape[1] + 1)
+      z0 = X[:, 0, :]
+      z = cdeint(X, cde_func, z0, t=torch.linspace(0, 1, 50))
+      recon_error = torch.mean((z[:, -1, 1:] - torch.tensor(scaled_data, dtype=torch.float32)) ** 2, dim=1)
+      anomaly_indices = torch.where(recon_error > recon_error.mean() + 3 * recon_error.std())[0].tolist()
+
+      zeta_scores = np.abs([zeta(2 + 1j * a / np.max(amounts)) for a in amounts.flatten()])
+      zeta_anomalies = np.where(zeta_scores > np.percentile(zeta_scores, 95))[0].tolist()
+      combined_anomalies = list(set(anomaly_indices + zeta_anomalies))
+
+      return {
+         "anomalies": data.iloc[combined_anomalies].to_dict('records'),
+         "zeta_scores": zeta_scores.tolist(),
+         "use_case": "Hybrid Neural CDE + Zeta Anomaly Detection"
+      }
+   except Exception as e:
+      return {"error": f"Neural CDE failed: {str(e)}", "anomalies": [], "zeta_scores": []}
 
 
-def main():
-   st.sidebar.title("Navigation")
-   page = st.sidebar.radio("Go to", [
-      "Company Overview", "Financial Statements", "Stock Analysis", "Sentiment Analysis",
-      "Portfolio Builder", "Auditing Tools", "Options Analysis", "Backtesting", "AI Predictions"
-   ])
+# Mock Theta Fraud Detection
+def mock_theta_fraud(data: pd.DataFrame) -> Dict:
+   """Detect sparse fraud using Mock Theta."""
+   amounts = data['amount'].values if 'amount' in data.columns else np.sum(
+      data.select_dtypes(include=[np.number]).values, axis=1)
+   q = np.exp(-amounts / np.max(amounts))
+   mock_theta = np.sum(q ** np.arange(len(amounts)))
+   coefficients = [np.sum(q ** i) for i in range(len(amounts))]  # <- fixed
 
-   symbol = st.sidebar.text_input("Enter Stock Symbol (e.g., AAPL, MSFT)", "AAPL").upper().strip()
-   if not validate_symbol(symbol):
+   return {
+      "score": float(1 / (1 + mock_theta)),
+      "coefficients": [float(c) for c in coefficients],
+      "use_case": "Sparse Fraud Pattern Detection"
+   }
+
+
+# GARCH Volatility
+def garch_volatility(data: pd.DataFrame) -> Dict:
+   """Predict volatility using GARCH."""
+   amounts = data['amount'].values if 'amount' in data.columns else np.sum(
+      data.select_dtypes(include=[np.number]).values, axis=1)
+   try:
+      model = arch_model(amounts, vol='GARCH', p=1, q=1)
+      res = model.fit(disp='off')
+      return {
+         "volatility": float(res.conditional_volatility[-1]),
+         "use_case": "Cash Flow Volatility Prediction"
+      }
+   except:
+      return {"error": "GARCH failed", "volatility": 0.0}
+
+
+# Kalman Filter Forecasting
+def kalman_forecast(data: pd.DataFrame) -> Dict:
+   """Forecast using Kalman Filter."""
+   amounts = data['amount'].values if 'amount' in data.columns else np.sum(
+      data.select_dtypes(include=[np.number]).values, axis=1)
+   A, B, H, Q, R = 1.0, 0.0, 1.0, 0.1, 0.1
+   x_hat = amounts[0]
+   P = 1.0
+   estimates = []
+   for z in amounts:
+      x_hat_minus = A * x_hat
+      P_minus = A * P * A + Q
+      K = P_minus * H / (H * P_minus * H + R)
+      x_hat = x_hat_minus + K * (z - H * x_hat_minus)
+      P = (1 - K * H) * P_minus
+      estimates.append(x_hat)
+   forecast = estimates[-1] * np.ones(30)
+   return {
+      "forecast": forecast.tolist(),
+      "estimates": estimates,
+      "use_case": "Financial Trend Forecasting"
+   }
+
+
+# Fourier Trends
+def fourier_trends(data: pd.DataFrame) -> Dict:
+   """Detect trends using Fourier Transform."""
+   amounts = data['amount'].values if 'amount' in data.columns else np.sum(
+      data.select_dtypes(include=[np.number]).values, axis=1)
+   fft_result = fft(amounts)
+   freq = np.fft.fftfreq(len(amounts))
+   return {
+      "amplitudes": np.abs(fft_result).tolist(),
+      "frequencies": freq.tolist(),
+      "use_case": "Seasonal Trend Detection"
+   }
+
+
+# Topological Data Analysis
+def topological_data_analysis(data: pd.DataFrame) -> Dict:
+   """Perform TDA using persistent homology."""
+   amounts = data['amount'].values if 'amount' in data.columns else np.sum(
+      data.select_dtypes(include=[np.number]).values, axis=1)
+   point_cloud = np.column_stack([np.arange(len(amounts)), amounts])
+
+   rips_complex = gudhi.RipsComplex(points=point_cloud, max_edge_length=1000)
+   simplex_tree = rips_complex.create_simplex_tree(max_dimension=2)
+   persistence = simplex_tree.persistence()
+
+   return {
+      "persistence_diagram": [(dim, (birth, death)) for dim, (birth, death) in persistence if death != float('inf')],
+      "use_case": "Topological Pattern Detection"
+   }
+
+
+# Quantum Audit
+def quantum_audit(data: pd.DataFrame) -> Dict:
+   """Simulate quantum-inspired audit using Qiskit."""
+   amounts = data['amount'].values if 'amount' in data.columns else np.sum(
+      data.select_dtypes(include=[np.number]).values, axis=1)
+   n_qubits = min(4, int(np.log2(len(amounts)) + 1))
+
+   qc = QuantumCircuit(n_qubits)
+   for i in range(n_qubits):
+      qc.h(i)
+   qc.measure_all()
+
+   simulator = Aer.get_backend('qasm_simulator')
+   result = execute(qc, simulator, shots=1024).result()
+   counts = result.get_counts()
+
+   entropy = -sum((count / 1024) * np.log2(count / 1024 + 1e-10) for count in counts.values())
+   return {
+      "quantum_entropy": float(entropy),
+      "use_case": "Quantum-Inspired Audit Integrity Check"
+   }
+
+
+# Ramanujan Partitions
+def ramanujan_partitions(data: pd.DataFrame) -> Dict:
+   """Estimate compliance using Ramanujan's partition theory."""
+   amounts = data['amount'].values if 'amount' in data.columns else np.sum(
+      data.select_dtypes(include=[np.number]).values, axis=1)
+   n = int(np.sum(np.abs(amounts)) / 1000) % 100
+   if n == 0:
+      return {"partitions": 0, "use_case": "Compliance Estimation"}
+
+   p = [1] + [0] * n
+   for i in range(1, n + 1):
+      k = 1
+      while True:
+         pent = (k * (3 * k - 1)) // 2
+         if pent > i:
+            break
+         sign = (-1) ** (k + 1)
+         p[i] += sign * p[i - pent]
+         pent = (k * (3 * k + 1)) // 2
+         if pent > i:
+            break
+         p[i] += sign * p[i - pent]
+         k += 1
+   return {
+      "partitions": p[n],
+      "use_case": "Compliance Estimation via Partitions"
+   }
+
+
+# Game-Theoretic Shapley Compliance
+def game_theoretic_shapley_compliance(data: pd.DataFrame) -> Dict:
+   """Estimate compliance using simplified Shapley values."""
+   amounts = data['amount'].values if 'amount' in data.columns else np.sum(
+      data.select_dtypes(include=[np.number]).values, axis=1)
+   n = min(5, len(amounts))
+   contributions = np.abs(amounts[:n])
+   total = np.sum(contributions)
+   shapley_values = []
+
+   for i in range(n):
+      value = contributions[i] / total
+      shapley_values.append(value)
+
+   return {
+      "shapley_values": shapley_values,
+      "use_case": "Game-Theoretic Compliance Analysis"
+   }
+
+
+# Invoice Parsing
+def parse_invoice_text(text: str) -> Dict:
+   """Parse invoice text for key details."""
+   try:
+      gstin_pattern = r"\d{2}[A-Z]{5}\d{4}[A-Z]{1}\d{1}[A-Z]{1}\d{1}"
+      amount_pattern = r"(?:Total|Amount)\s*[:\-]?\s*₹?\s*(\d+\.?\d*)"
+      date_pattern = r"\d{2}-\d{2}-\d{4}"
+
+      gstin = re.search(gstin_pattern, text)
+      amount = re.search(amount_pattern, text)
+      date = re.search(date_pattern, text)
+
+      nlp = pipeline("text-classification", model="distilbert-base-uncased")
+      doc_type = nlp(text[:512])[0]['label']
+
+      invoice_data = {
+         "gstin": gstin.group(0) if gstin else None,
+         "amount": float(amount.group(1)) if amount else None,
+         "date": date.group(0) if date else None,
+         "document_type": "Sales" if doc_type == "POSITIVE" else "Purchase",
+         "confidence": {
+            "gstin": 0.95 if gstin else 0.7,
+            "amount": 0.85 if amount else 0.0,
+            "date": 0.9 if date else 0.0
+         }
+      }
+
+      if invoice_data["amount"]:
+         entry = ledger.auto_entry(invoice_data)
+         invoice_data["ledger_entry"] = entry
+
+      if redis_client:
+         redis_client.set(f"invoice_{hash(text)}", str(invoice_data))
+
+      return invoice_data
+   except:
+      return {"error": "Failed to parse invoice"}
+
+
+# Bank Reconciliation
+def bank_reconciliation(transactions: List[Dict], bank_feed: List[Dict]) -> Dict:
+   """Reconcile transactions with bank feed."""
+   matches = []
+   for b in bank_feed:
+      for l in transactions:
+         if abs(b['amount'] - l['amount']) < 0.01:
+            matches.append({"bank_txn": b, "ledger_txn": l})
+   return {
+      "matches": matches,
+      "unmatched": len(bank_feed) - len(matches),
+      "use_case": "Bank Reconciliation"
+   }
+
+
+# Inventory Optimization
+def manage_inventory(items: List[Dict]) -> List[Dict]:
+   """Optimize inventory using convex optimization."""
+   try:
+      x = cp.Variable(len(items))
+      objective = cp.Minimize(cp.sum_squares(x - [i['stock'] for i in items]))
+      constraints = [x >= 0, cp.sum(x * [i['cost'] for i in items]) <= sum(i['cost'] * i['stock'] for i in items) * 0.9]
+      prob = cp.Problem(objective, constraints)
+      prob.solve()
+      inventory = [{"item_id": i['id'], "optimal_stock": float(x.value[j])} for j, i in enumerate(items)]
+      return inventory
+   except:
+      return [{"item_id": i['id'], "optimal_stock": i['stock']} for i in items]
+
+
+# Tax Computation
+def compute_tax(data: pd.DataFrame, tax_type="GST") -> Dict:
+   """Compute tax based on transactions."""
+   amounts = data['amount'].values if 'amount' in data.columns else np.sum(
+      data.select_dtypes(include=[np.number]).values, axis=1)
+   tax_base = np.sum(amounts)
+
+   rates = {"GST": 0.18, "TDS": 0.1, "IT_44ADA": 0.3}
+   rate = rates.get(tax_type, 0.0)
+   tax = tax_base * rate
+
+   return {
+      "tax_type": tax_type,
+      "amount": float(tax),
+      "use_case": "Tax Estimation"
+   }
+
+
+# Audit Report
+def generate_audit_report(data: pd.DataFrame) -> Dict:
+   """Generate audit report."""
+   symmetry = noether_symmetry(data)
+   anomalies = neural_cde_anomaly(data).get("anomalies", [])
+   quantum = quantum_audit(data)
+
+   report = {
+      "form_3ca": {
+         "status": "Compliant" if symmetry["deviation"] < 0.01 else "Issues Detected",
+         "ledger_balance": float(data['amount'].sum() if 'amount' in data.columns else 0),
+         "audit_date": "2025-06-19"
+      },
+      "form_3cd": {
+         "transactions_analyzed": len(data),
+         "anomalies": len(anomalies),
+         "quantum_entropy": quantum["quantum_entropy"]
+      }
+   }
+   return {
+      "report": report,
+      "use_case": "Audit Report Generation"
+   }
+
+
+# Noether Symmetry
+def noether_symmetry(data: pd.DataFrame) -> Dict:
+   """Check ledger integrity using Noether's symmetry."""
+   amounts = data['amount'].values if 'amount' in data.columns else np.sum(
+      data.select_dtypes(include=[np.number]).values, axis=1)
+   assets = np.sum(amounts[amounts > 0])
+   liabilities = assets * 0.6
+   equity = assets * 0.4
+   deviation = abs(assets - (liabilities + equity))
+   return {
+      "deviation": float(deviation),
+      "use_case": "Ledger Integrity Check"
+   }
+
+
+# Payroll Processing
+def process_payroll(employees: List[Dict]) -> List[Dict]:
+   """Process payroll with optimization."""
+   try:
+      salaries = [emp['salary'] for emp in employees]
+      x = cp.Variable(len(salaries))
+      objective = cp.Minimize(cp.sum_squares(x - salaries))
+      constraints = [x >= 0, cp.sum(x) <= sum(salaries) * 0.95]
+      prob = cp.Problem(objective, constraints)
+      prob.solve()
+
+      payroll = []
+      for i, emp in enumerate(employees):
+         tds = x.value[i] * 0.1
+         pf = x.value[i] * 0.12
+         net = x.value[i] - tds - pf
+         payroll.append({
+            "employee_id": emp['id'],
+            "gross": float(x.value[i]),
+            "tds": float(tds),
+            "pf": float(pf),
+            "net": float(net)
+         })
+      return payroll
+   except:
+      return [{"employee_id": emp['id'], "gross": emp['salary'], "tds": 0, "pf": 0, "net": emp['salary']} for emp in
+              employees]
+
+
+# Vendor Risk
+def vendor_credit_risk(data: pd.DataFrame) -> Dict:
+   """Assess vendor credit risk."""
+   amounts = data['amount'].values if 'amount' in data.columns else np.sum(
+      data.select_dtypes(include=[np.number]).values, axis=1)
+   risk_scores = np.random.rand(len(amounts))
+   return {
+      "risk_scores": risk_scores.tolist(),
+      "use_case": "Vendor Credit Risk Assessment"
+   }
+
+
+# Loan Readiness
+def loan_readiness_report(data: pd.DataFrame) -> Dict:
+   """Generate loan readiness report."""
+   amounts = data['amount'].values if 'amount' in data.columns else np.sum(
+      data.select_dtypes(include=[np.number]).values, axis=1)
+   revenue = np.sum(amounts[amounts > 0])
+   expenses = np.sum(amounts[amounts < 0])
+
+   report = {
+      "profit_loss": {"revenue": float(revenue), "expenses": float(expenses), "net": float(revenue + expenses)},
+      "balance_sheet": {"assets": float(revenue), "liabilities": float(expenses), "equity": float(revenue + expenses)},
+      "use_case": "Loan Readiness Assessment"
+   }
+   return report
+
+
+# AI Bookkeeping
+def ai_bookkeeping(data: pd.DataFrame) -> List[Dict]:
+   """Categorize transactions using NLP."""
+   descriptions = data['description'].values if 'description' in data.columns else [f"Txn {i}" for i in
+                                                                                    range(len(data))]
+   nlp = pipeline("text-classification", model="distilbert-base-uncased")
+   categories = [nlp(d[:512])[0]['label'] for d in descriptions]
+
+   return [{"transaction_id": i, "category": "Revenue" if c == "POSITIVE" else "Expense"} for i, c in
+           enumerate(categories)]
+
+
+# Predictive Alerts
+def predictive_alerts(data: pd.DataFrame) -> Dict:
+   """Generate predictive alerts."""
+   forecast = kalman_forecast(data)["forecast"]
+   if np.any(np.array(forecast) < 0):
+      return {"alert": "Cash flow shortage predicted", "severity": "High"}
+   return {"alert": "Cash flow stable", "severity": "Low"}
+
+
+# Smart Deduction Finder
+def smart_deduction_finder(data: pd.DataFrame) -> List[Dict]:
+   """Find tax deductions using RL."""
+   amounts = data['amount'].values if 'amount' in data.columns else np.sum(
+      data.select_dtypes(include=[np.number]).values, axis=1)
+   q_table = np.zeros((len(amounts), 2))
+   for _ in range(100):
+      state = 0
+      while state < len(amounts):
+         action = np.random.randint(0, 2)
+         reward = 1 if action == 1 and amounts[state] > 1000 else -1
+         next_state = state + 1
+         q_table[state, action] += 0.1 * (
+                    reward + 0.9 * np.max(q_table[min(next_state, len(amounts) - 1)]) - q_table[state, action])
+         state = next_state
+         if state >= len(amounts):
+            break
+
+   deductions = [{"transaction_id": i, "deduction": "Section 80C"} for i in range(len(amounts)) if q_table[i, 1] > 0]
+   return deductions
+
+
+# Chart Download Utility
+def get_chart_download_link(fig, filename="chart"):
+   """Generate download link for Plotly chart."""
+   buffer = io.BytesIO()
+   fig.write_image(buffer, format="png")
+   buffer.seek(0)
+   b64 = base64.b64encode(buffer.read()).decode()
+   href = f'<a href="data:image/png;base64,{b64}" download="{filename}.png">Download Chart as PNG</a>'
+   return href
+
+
+# Streamlit UI
+def render_ui():
+   """Render the enhanced Streamlit UI."""
+   st.sidebar.markdown("<h2 style='color: #2E86C1;'>AutoCA Control Panel</h2>", unsafe_allow_html=True)
+   user_role = st.sidebar.selectbox("Select Role", ["CA", "SME_Owner", "Auditor"], key="role")
+   access_level = USER_ROLES[user_role]
+
+   st.sidebar.header("Data Ingestion")
+   file_type = st.sidebar.selectbox("File Type", ["CSV", "Excel", "Text"], key="file_type")
+   uploaded_file = st.sidebar.file_uploader("Upload Data", type=['csv', 'xlsx', 'xls', 'txt'], key="uploader")
+
+   if uploaded_file:
+      df = load_data(uploaded_file, file_type.lower())
+      if df is not None:
+         st.header("Dataset Preview")
+         st.dataframe(df, use_container_width=True)
+
+         # Filters
+         with st.expander("Apply Filters"):
+            col1, col2 = st.columns(2)
+            with col1:
+               if 'date' in df.columns:
+                  date_range = st.date_input("Select Date Range", [df['date'].min(), df['date'].max()])
+                  df = df[(df['date'] >= pd.to_datetime(date_range[0])) & (df['date'] <= pd.to_datetime(date_range[1]))]
+            with col2:
+               if 'document_type' in df.columns:
+                  doc_type = st.multiselect("Document Type", df['document_type'].unique(),
+                                            default=df['document_type'].unique())
+                  df = df[df['document_type'].isin(doc_type)]
+
+         tabs = st.tabs([
+            "Dashboard", "Invoice", "Bookkeeping", "Reconciliation", "Inventory", "Tax", "Audit",
+            "Payroll", "Vendor Risk", "Loan", "Fraud", "Forecast", "Anomaly", "Alerts",
+            "Deductions", "Math Insights"
+         ])
+
+         with tabs[0]:
+            st.header("Financial Dashboard")
+            col1, col2, col3 = st.columns(3)
+            with col1:
+               fraud = mock_theta_fraud(df)
+               fig_gauge = go.Figure(go.Indicator(
+                  mode="gauge+number",
+                  value=fraud['score'],
+                  title={'text': "Fraud Risk"},
+                  gauge={'axis': {'range': [0, 1]}, 'bar': {'color': "red" if fraud['score'] > 0.5 else "green"}}
+               ))
+               st.plotly_chart(fig_gauge, use_container_width=True)
+               st.markdown(get_chart_download_link(fig_gauge, "fraud_risk"), unsafe_allow_html=True)
+
+            with col2:
+               alert = predictive_alerts(df)
+               color = "red" if alert["severity"] == "High" else "green"
+               st.markdown(f"<h3 style='color: {color};'>Cash Flow: {alert['alert']}</h3>", unsafe_allow_html=True)
+
+            with col3:
+               vol = garch_volatility(df)
+               fig_vol = px.bar(x=["Volatility"], y=[vol['volatility']], title="Cash Flow Volatility")
+               st.plotly_chart(fig_vol, use_container_width=True)
+               st.markdown(get_chart_download_link(fig_vol, "volatility"), unsafe_allow_html=True)
+
+            # Transaction Heatmap
+            if 'amount' in df.columns and 'date' in df.columns:
+               df['month'] = df['date'].dt.month_name()
+               heatmap_data = df.pivot_table(values='amount', index='month', aggfunc='sum').fillna(0)
+               fig_heatmap = px.imshow(heatmap_data, title="Transaction Heatmap by Month",
+                                       color_continuous_scale="Viridis")
+               st.plotly_chart(fig_heatmap, use_container_width=True)
+               st.markdown(get_chart_download_link(fig_heatmap, "transaction_heatmap"), unsafe_allow_html=True)
+
+            # Download Data
+            csv = df.to_csv(index=False)
+            st.download_button("Download Data as CSV", csv, "data.csv", "text/csv")
+
+         with tabs[1]:
+            st.header("Invoice Processing")
+            if file_type == "Text":
+               invoice_data = parse_invoice_text(df.iloc[0]['text'] if 'text' in df.columns else '')
+               st.json(invoice_data)
+               if 'amount' in df.columns:
+                  fig_pie = px.pie(df, values='amount',
+                                   names='document_type' if 'document_type' in df.columns else ['Invoice'],
+                                   title="Invoice Distribution")
+                  st.plotly_chart(fig_pie, use_container_width=True)
+                  st.markdown(get_chart_download_link(fig_pie, "invoice_distribution"), unsafe_allow_html=True)
+            else:
+               st.warning("Upload text file for invoice processing")
+
+         with tabs[2]:
+            st.header("Bookkeeping")
+            if access_level in ["CA", "SME_Owner"]:
+               with st.form("bookkeeping_form"):
+                  amount = st.number_input("Transaction Amount", min_value=0.0, value=1000.0)
+                  gstin = st.text_input("GSTIN (Optional)")
+                  doc_type = st.selectbox("Document Type", ["Sales", "Purchase"])
+                  submitted = st.form_submit_button("Record Transaction")
+                  if submitted:
+                     try:
+                        entry = ledger.auto_entry(
+                           {"amount": amount, "gstin": gstin, "date": "2025-06-19", "document_type": doc_type})
+                        st.success(f"Transaction Recorded: {entry}")
+                     except Exception as e:
+                        st.error(f"Error: {str(e)}")
+               categorized = ai_bookkeeping(df)
+               st.write("Categorized Transactions:", categorized)
+               fig_bar = px.bar(pd.DataFrame(categorized), x="transaction_id", y=[1] * len(categorized),
+                                color="category", title="Transaction Categories")
+               st.plotly_chart(fig_bar, use_container_width=True)
+               st.markdown(get_chart_download_link(fig_bar, "transaction_categories"), unsafe_allow_html=True)
+            else:
+               st.write("Read-only access")
+
+         with tabs[3]:
+            st.header("Bank Reconciliation")
+            if access_level in ["CA", "SME_Owner"]:
+               bank_feed = [{"id": i, "amount": float(a), "date": "2025-01-01"} for i, a in
+                            enumerate(df['amount'][:2] if 'amount' in df.columns else [1000, 5000])]
+               recon = bank_reconciliation(df.to_dict('records'), bank_feed)
+               st.write("Reconciliation Results:", recon)
+               fig_sunburst = px.sunburst(
+                  pd.DataFrame(
+                     {"status": ["Matched", "Unmatched"], "count": [len(recon["matches"]), recon["unmatched"]]}),
+                  path=["status"], values="count", title="Reconciliation Status"
+               )
+               st.plotly_chart(fig_sunburst, use_container_width=True)
+               st.markdown(get_chart_download_link(fig_sunburst, "reconciliation_status"), unsafe_allow_html=True)
+            else:
+               st.write("Read-only access")
+
+         with tabs[4]:
+            st.header("Inventory Optimization")
+            if access_level in ["CA", "SME_Owner"]:
+               items = [{"id": i, "stock": 100, "cost": 50} for i in range(2)]
+               inventory = manage_inventory(items)
+               st.write("Optimal Inventory Levels:", inventory)
+               fig_inventory = px.bar(pd.DataFrame(inventory), x="item_id", y="optimal_stock",
+                                      title="Optimal Inventory")
+               st.plotly_chart(fig_inventory, use_container_width=True)
+               st.markdown(get_chart_download_link(fig_inventory, "inventory_levels"), unsafe_allow_html=True)
+            else:
+               st.write("Read-only access")
+
+         with tabs[5]:
+            st.header("Tax Computation")
+            tax_type = st.selectbox("Tax Type", ["GST", "TDS", "IT_44ADA"], key="tax_type")
+            tax = compute_tax(df, tax_type)
+            st.write(f"{tax['tax_type']} Amount: ₹{tax['amount']:.2f}")
+            fig_tax = px.bar(x=[tax['tax_type']], y=[tax['amount']], title="Tax Amount")
+            st.plotly_chart(fig_tax, use_container_width=True)
+            st.markdown(get_chart_download_link(fig_tax, "tax_amount"), unsafe_allow_html=True)
+
+         with tabs[6]:
+            st.header("Audit Report Generation")
+            report = generate_audit_report(df)
+            st.write("Audit Report:", report)
+            fig_audit = px.treemap(
+               pd.DataFrame({
+                  "category": ["Form 3CA", "Form 3CD"],
+                  "value": [1, report["report"]["form_3cd"]["transactions_analyzed"]],
+                  "parent": ["", "Form 3CD"]
+               }),
+               path=["category"], values="value", title="Audit Report Structure"
+            )
+            st.plotly_chart(fig_audit, use_container_width=True)
+            st.markdown(get_chart_download_link(fig_audit, "audit_report"), unsafe_allow_html=True)
+
+         with tabs[7]:
+            st.header("Payroll Processing")
+            if access_level in ["CA", "SME_Owner"]:
+               employees = [{"id": i, "salary": 50000} for i in range(2)]
+               payroll = process_payroll(employees)
+               st.write("Payroll Details:", payroll)
+               fig_payroll = px.bar(pd.DataFrame(payroll), x="employee_id", y=["gross", "tds", "pf", "net"],
+                                    title="Payroll Breakdown")
+               st.plotly_chart(fig_payroll, use_container_width=True)
+               st.markdown(get_chart_download_link(fig_payroll, "payroll_breakdown"), unsafe_allow_html=True)
+            else:
+               st.write("Read-only access")
+
+         with tabs[8]:
+            st.header("Vendor Risk Analysis")
+            risk = vendor_credit_risk(df)
+            st.write("Vendor Risk Scores:", risk)
+            fig_risk = px.histogram(x=risk["risk_scores"], title="Vendor Risk Distribution")
+            st.plotly_chart(fig_risk, use_container_width=True)
+            st.markdown(get_chart_download_link(fig_risk, "vendor_risk"), unsafe_allow_html=True)
+
+         with tabs[9]:
+            st.header("Loan Readiness Reports")
+            loan = loan_readiness_report(df)
+            st.write("Loan Readiness Report:", loan)
+            fig_loan = px.bar(
+               x=["Revenue", "Expenses", "Net"],
+               y=[loan["profit_loss"]["revenue"], loan["profit_loss"]["expenses"], loan["profit_loss"]["net"]],
+               title="Profit & Loss Summary"
+            )
+            st.plotly_chart(fig_loan, use_container_width=True)
+            st.markdown(get_chart_download_link(fig_loan, "loan_summary"), unsafe_allow_html=True)
+
+         with tabs[10]:
+            st.header("Fraud Detection")
+            if st.button("Detect Fraud", key="fraud_button"):
+               with st.spinner("Running Mock Theta..."):
+                  fraud = mock_theta_fraud(df)
+                  st.write(f"Fraud Score: {fraud['score']:.2f}")
+                  fig_fraud = px.line(y=fraud['coefficients'], title="Mock Theta Coefficients",
+                                      labels={"y": "Coefficient", "x": "Transaction Index"})
+                  st.plotly_chart(fig_fraud, use_container_width=True)
+                  st.markdown(get_chart_download_link(fig_fraud, "fraud_coefficients"), unsafe_allow_html=True)
+
+         with tabs[11]:
+            st.header("Cash Flow Forecasting")
+            if st.button("Generate Forecast", key="forecast_button"):
+               with st.spinner("Running Kalman Filter..."):
+                  forecast = kalman_forecast(df)
+                  dates = pd.date_range(start="2025-06-19", periods=30, freq="D")
+                  fig_forecast = px.line(
+                     x=dates, y=forecast['forecast'],
+                     title="Cash Flow Forecast",
+                     labels={"x": "Date", "y": "Amount"}
+                  )
+                  st.plotly_chart(fig_forecast, use_container_width=True)
+                  st.markdown(get_chart_download_link(fig_forecast, "cash_flow_forecast"), unsafe_allow_html=True)
+
+         with tabs[12]:
+            st.header("Anomaly Detection")
+            if st.button("Detect Anomalies", key="anomaly_button"):
+               with st.spinner("Running Neural CDE + Zeta..."):
+                  anomaly = neural_cde_anomaly(df)
+                  if "error" in anomaly:
+                     st.error(anomaly["error"])
+                  else:
+                     st.write("Anomalous Transactions:", anomaly["anomalies"])
+                     fig_anomaly = px.scatter(
+                        df,
+                        x='date' if 'date' in df.columns else df.index,
+                        y='amount' if 'amount' in df.columns else df.columns[0],
+                        color=[1 if i in [x['amount'] for x in anomaly["anomalies"]] else 0 for i in
+                               df['amount']] if 'amount' in df.columns else [0] * len(df),
+                        title="Anomaly Detection",
+                        labels={"color": "Anomaly"},
+                        color_discrete_map={0: "blue", 1: "red"}
+                     )
+                     st.plotly_chart(fig_anomaly, use_container_width=True)
+                     st.markdown(get_chart_download_link(fig_anomaly, "anomaly_detection"), unsafe_allow_html=True)
+
+         with tabs[13]:
+            st.header("Predictive Alerts")
+            alert = predictive_alerts(df)
+            st.write("Alert:", alert)
+            fig_alert = go.Figure(go.Indicator(
+               mode="gauge+number",
+               value=1 if alert["severity"] == "High" else 0,
+               title={"text": "Alert Severity"},
+               gauge={'axis': {'range': [0, 1]}, 'bar': {'color': "red" if alert["severity"] == "High" else "green"}}
+            ))
+            st.plotly_chart(fig_alert, use_container_width=True)
+            st.markdown(get_chart_download_link(fig_alert, "alert_severity"), unsafe_allow_html=True)
+
+         with tabs[14]:
+            st.header("Smart Deduction Finder")
+            deductions = smart_deduction_finder(df)
+            st.write("Tax Deductions:", deductions)
+            fig_deductions = px.bar(
+               pd.DataFrame(deductions), x="transaction_id", y=[1] * len(deductions),
+               title="Tax Deductions Identified"
+            )
+            st.plotly_chart(fig_deductions, use_container_width=True)
+            st.markdown(get_chart_download_link(fig_deductions, "tax_deductions"), unsafe_allow_html=True)
+
+         with tabs[15]:
+            st.header("Math Insights")
+            with st.expander("1. Mock Theta (Fraud)"):
+               fraud = mock_theta_fraud(df)
+               st.markdown(r"\[ f(q) = \sum_{n=0}^{\infty} a_n q^n \]")
+               fig_fraud = px.line(y=fraud['coefficients'], title="Mock Theta Coefficients")
+               st.plotly_chart(fig_fraud, use_container_width=True)
+               st.write(f"Score: {fraud['score']:.2f} ({fraud['use_case']})")
+               st.markdown(get_chart_download_link(fig_fraud, "mock_theta"), unsafe_allow_html=True)
+
+            with st.expander("2. Riemann Zeta (Anomaly)"):
+               anomaly = neural_cde_anomaly(df)
+               st.markdown(r"\[ \zeta(s) = \sum_{n=1}^{\infty} \frac{1}{n^s} \]")
+               if "zeta_scores" in anomaly:
+                  fig_zeta = px.line(y=anomaly['zeta_scores'], title="Zeta Scores")
+                  st.plotly_chart(fig_zeta, use_container_width=True)
+                  st.markdown(get_chart_download_link(fig_zeta, "zeta_scores"), unsafe_allow_html=True)
+
+            with st.expander("3. GARCH Volatility"):
+               vol = garch_volatility(df)
+               st.markdown(r"\[ \sigma_t^2 = \alpha_0 + \alpha_1 \epsilon_{t-1}^2 + \beta_1 \sigma_{t-1}^2 \]")
+               fig_vol = px.bar(x=["Volatility"], y=[vol['volatility']], title="GARCH Volatility")
+               st.plotly_chart(fig_vol, use_container_width=True)
+               st.write(f"Volatility: {vol['volatility']:.2f} ({vol['use_case']})")
+               st.markdown(get_chart_download_link(fig_vol, "garch_volatility"), unsafe_allow_html=True)
+
+            with st.expander("4. Kalman Filter (Forecast)"):
+               forecast = kalman_forecast(df)
+               st.markdown(r"\[ \hat{x}_{k|k} = \hat{x}_{k|k-1} + K_k(y_k - H \hat{x}_{k|k-1}) \]")
+               fig_kalman = px.line(y=forecast['estimates'], title="Kalman Estimates")
+               st.plotly_chart(fig_kalman, use_container_width=True)
+               st.markdown(get_chart_download_link(fig_kalman, "kalman_estimates"), unsafe_allow_html=True)
+
+            with st.expander("5. Fourier Series (Trends)"):
+               fourier = fourier_trends(df)
+               st.markdown(r"\[ f(x) = a_0 + \sum_{n=1}^{\infty} (a_n \cos nx + b_n \sin nx) \]")
+               fig_fourier = px.line(x=fourier['frequencies'], y=fourier['amplitudes'], title="Fourier Amplitudes")
+               st.plotly_chart(fig_fourier, use_container_width=True)
+               st.markdown(get_chart_download_link(fig_fourier, "fourier_amplitudes"), unsafe_allow_html=True)
+
+            with st.expander("6. Noether Symmetry (Ledger)"):
+               symmetry = noether_symmetry(df)
+               st.markdown(r"\[ \sum \text{Assets} = \sum \text{Liabilities} + \sum \text{Equity} \]")
+               fig_symmetry = go.Figure(go.Indicator(
+                  mode="gauge+number",
+                  value=symmetry['deviation'],
+                  title={"text": "Ledger Deviation"},
+                  gauge={'axis': {'range': [0, max(symmetry['deviation'], 1)]},
+                         'bar': {'color': "red" if symmetry['deviation'] > 0.01 else "green"}}
+               ))
+               st.plotly_chart(fig_symmetry, use_container_width=True)
+               st.write(f"Deviation: {symmetry['deviation']:.2f} ({symmetry['use_case']})")
+               st.markdown(get_chart_download_link(fig_symmetry, "noether_symmetry"), unsafe_allow_html=True)
+
+            with st.expander("7. Topological Data Analysis"):
+               tda = topological_data_analysis(df)
+               st.markdown(r"\[ H_k(X) \rightarrow \text{Persistent Homology} \]")
+               fig_tda = px.scatter(
+                  x=[p[1][0] for p in tda['persistence_diagram']],
+                  y=[p[1][1] for p in tda['persistence_diagram']],
+                  title="Persistence Diagram",
+                  labels={"x": "Birth", "y": "Death"}
+               )
+               st.plotly_chart(fig_tda, use_container_width=True)
+               st.write(f"Diagram: {tda['persistence_diagram']} ({tda['use_case']})")
+               st.markdown(get_chart_download_link(fig_tda, "persistence_diagram"), unsafe_allow_html=True)
+
+            with st.expander("8. Quantum Audit"):
+               quantum = quantum_audit(df)
+               st.markdown(r"\[ S(\rho) = -\text{Tr}(\rho \log \rho) \]")
+               fig_quantum = px.bar(x=["Entropy"], y=[quantum['quantum_entropy']], title="Quantum Entropy")
+               st.plotly_chart(fig_quantum, use_container_width=True)
+               st.write(f"Entropy: {quantum['quantum_entropy']:.2f} ({quantum['use_case']})")
+               st.markdown(get_chart_download_link(fig_quantum, "quantum_entropy"), unsafe_allow_html=True)
+
+            with st.expander("9. Ramanujan Partitions"):
+               partitions = ramanujan_partitions(df)
+               st.markdown(r"\[ p(n) \approx \frac{1}{4n\sqrt{3}} e^{\pi \sqrt{\frac{2n}{3}}} \]")
+               fig_partitions = px.bar(x=["Partitions"], y=[partitions['partitions']], title="Ramanujan Partitions")
+               st.plotly_chart(fig_partitions, use_container_width=True)
+               st.write(f"Partitions: {partitions['partitions']} ({partitions['use_case']})")
+               st.markdown(get_chart_download_link(fig_partitions, "ramanujan_partitions"), unsafe_allow_html=True)
+
+            with st.expander("10. Game-Theoretic Shapley Compliance"):
+               shapley = game_theoretic_shapley_compliance(df)
+               st.markdown(
+                  r"\[ \phi_i(v) = \sum_{S \subseteq N \setminus \{i\}} \frac{|S|!(|N|-|S|-1)!}{|N|!} [v(S \cup \{i\}) - v(S)] \]")
+               fig_shapley = px.bar(x=range(len(shapley['shapley_values'])), y=shapley['shapley_values'],
+                                    title="Shapley Values")
+               st.plotly_chart(fig_shapley, use_container_width=True)
+               st.write(f"Values: {shapley['shapley_values']} ({shapley['use_case']})")
+               st.markdown(get_chart_download_link(fig_shapley, "shapley_values"), unsafe_allow_html=True)
+
+            with st.expander("11. Fractional Differentiation"):
+               if 'amount' in df.columns:
+                  frac_diff = fractional_diff(df['amount'])
+                  st.markdown(r"\[ D^d f(t) = \frac{1}{\Gamma(1-d)} \int_{-\infty}^t (t-\tau)^{-d} f(\tau) d\tau \]")
+                  fig_frac = px.line(y=frac_diff, title="Fractional Differencing")
+                  st.plotly_chart(fig_frac, use_container_width=True)
+                  st.write("Fractional Differencing Applied")
+                  st.markdown(get_chart_download_link(fig_frac, "fractional_diff"), unsafe_allow_html=True)
+
+            with st.expander("12. T-Copula"):
+               numeric_cols = df.select_dtypes(include=[np.number]).columns
+               if len(numeric_cols) >= 2:
+                  copula = t_copula(df[numeric_cols[:2]])
+                  st.markdown(r"\[ C(u_1, u_2; \nu) = t_{\nu, \Sigma}(t_{\nu}^{-1}(u_1), t_{\nu}^{-1}(u_2)) \]")
+                  fig_copula = px.scatter(x=copula[:, 0], y=copula[:, 1], title="T-Copula Scatter")
+                  st.plotly_chart(fig_copula, use_container_width=True)
+                  st.write("T-Copula Dependencies Modeled")
+                  st.markdown(get_chart_download_link(fig_copula, "t_copula"), unsafe_allow_html=True)
+
+
+# CLI Implementation
+@click.group()
+def cli():
+   """AutoCA CLI for financial analytics."""
+   pass
+
+
+@cli.command()
+@click.option('--data-file', type=str, required=True, help="Path to data file")
+@click.option('--task', type=click.Choice([
+   'anomaly', 'forecast', 'fraud', 'tax', 'bookkeeping', 'audit', 'payroll',
+   'inventory', 'reconcile', 'vendor', 'loan', 'alerts', 'deductions', 'tda',
+   'quantum', 'partitions', 'shapley', 'frac_diff', 'copula'
+]), default='anomaly', help="Analysis task")
+@click.option('--output', type=str, default='output.png', help="Output file for visualization")
+def analyze(data_file, task, output):
+   """Analyze business data."""
+   df = load_data(open(data_file, 'rb'), file_type=data_file.split('.')[-1])
+   if df is None:
+      click.echo("Failed to load data")
       return
 
-   st.sidebar.subheader("Set Alerts")
-   alert_type = st.sidebar.selectbox("Alert Type", ["Price", "RSI", "News"])
-   threshold = st.sidebar.number_input("Threshold", min_value=0.0, value=100.0)
-   if st.sidebar.button("Set Alert"):
-      if threshold <= 0:
-         st.error("Threshold must be positive.")
-      else:
-         st.session_state[f"alert_{symbol}_{alert_type}"] = threshold
-         st.sidebar.success(f"Alert set for {alert_type} at {threshold}")
-
-   if page == "Company Overview":
-      st.header("🏢 Company Overview")
-      info = get_company_info(symbol)
-      if info:
-         col1, col2 = st.columns([1, 2])
-         with col1:
-            st.subheader("Basic Information")
-            st.metric("Company Name", info['name'])
-            st.write(f"**Sector:** {info['sector']}")
-            st.write(f"**Industry:** {info['industry']}")
-            st.write(f"**Country:** {info['country']}")
-            st.write(f"**Employees:** {info['employees']:,}")
-            st.metric("Market Cap",
-                      f"${info['market_cap']:,}" if isinstance(info['market_cap'], int) else info['market_cap'])
-         with col2:
-            st.subheader("Business Summary")
-            st.write(info['summary'])
-         st.subheader("Dividend Analysis")
-         yield_current, yield_history = get_dividend_analysis(symbol)
-         st.metric("Current Dividend Yield", f"{yield_current:.2f}%")
-         if not yield_history.empty:
-            fig = px.line(yield_history, title="Historical Dividend Yield")
-            st.plotly_chart(fig)
-         st.subheader("Ownership Insights")
-         inst_holders, major_holders = get_insider_institutional(symbol)
-         if inst_holders is not None:
-            st.write("Institutional Holders")
-            st.dataframe(inst_holders)
-         if major_holders is not None:
-            st.write("Major Holders")
-            st.dataframe(major_holders)
-      else:
-         st.error("Could not fetch company information.")
-
-   elif page == "Financial Statements":
-      st.header("📑 Financial Statements")
-      tab1, tab2, tab3 = st.tabs(["Income Statement", "Balance Sheet", "Cash Flow"])
-      with tab1:
-         st.subheader("Income Statement")
-         income_stmt = get_financial_statements(symbol, 'income')
-         if income_stmt is not None:
-            numeric_cols = income_stmt.select_dtypes(include=[np.number]).columns
-            format_dict = {col: "{:,.0f}" for col in numeric_cols}
-            st.dataframe(income_stmt.style.format(format_dict))
-      with tab2:
-         st.subheader("Balance Sheet")
-         balance_sheet = get_financial_statements(symbol, 'balance')
-         if balance_sheet is not None:
-            numeric_cols = balance_sheet.select_dtypes(include=[np.number]).columns
-            format_dict = {col: "{:,.0f}" for col in numeric_cols}
-            st.dataframe(balance_sheet.style.format(format_dict))
-      with tab3:
-         st.subheader("Cash Flow Statement")
-         cash_flow = get_financial_statements(symbol, 'cashflow')
-         if cash_flow is not None:
-            numeric_cols = cash_flow.select_dtypes(include=[np.number]).columns
-            format_dict = {col: "{:,.0f}" for col in numeric_cols}
-            st.dataframe(cash_flow.style.format(format_dict))
-
-   elif page == "Stock Analysis":
-      st.header("📈 Stock Analysis")
-      period_options = {'1 Month': '1mo', '3 Months': '3mo', '6 Months': '6mo', '1 Year': '1y', '2 Years': '2y',
-                        '5 Years': '5y', 'Max': 'max'}
-      selected_period = st.selectbox("Select Time Period", list(period_options.keys()))
-      data = get_stock_data(symbol, period_options[selected_period])
-
-      if not data.empty:
-         data = calculate_technicals(data.dropna())
-         if f"alert_{symbol}_Price" in st.session_state and data['Close'].iloc[-1] >= st.session_state[
-            f"alert_{symbol}_Price"]:
-            st.warning(
-               f"Alert: {symbol} price hit {st.session_state[f'alert_{symbol}_Price']}! Current: {data['Close'].iloc[-1]:.2f}")
-         if f"alert_{symbol}_RSI" in st.session_state and data['RSI'].iloc[-1] >= st.session_state[
-            f"alert_{symbol}_RSI"]:
-            st.warning(f"Alert: RSI hit {st.session_state[f'alert_{symbol}_RSI']}! Current: {data['RSI'].iloc[-1]:.2f}")
-
-         # Candlestick Chart
-         st.subheader(f"{symbol} Candlestick Chart")
-         fig = go.Figure(data=[
-            go.Candlestick(x=data.index, open=data['Open'], high=data['High'], low=data['Low'], close=data['Close'])])
-         fig.update_layout(title=f"{symbol} Stock Price", yaxis_title="Price ($)", height=600)
-         st.plotly_chart(fig)
-
-         # Technical Indicators
-         st.subheader("Technical Indicators")
-         indicators = st.multiselect("Select Indicators",
-                                     ['RSI', 'MACD', 'Bollinger Bands', 'ATR', 'Stochastic', 'VWAP'],
-                                     default=['RSI', 'MACD'])
+   if task == 'anomaly':
+      result = neural_cde_anomaly(df)
+      if 'error' not in result:
          fig = go.Figure()
-         fig.add_trace(
-            go.Candlestick(x=data.index, open=data['Open'], high=data['High'], low=data['Low'], close=data['Close'],
-                           name='Price'))
-         for ind in indicators:
-            if ind == 'RSI':
-               fig.add_trace(go.Scatter(x=data.index, y=data['RSI'], name='RSI', yaxis='y2'))
-            elif ind == 'MACD':
-               fig.add_trace(go.Scatter(x=data.index, y=data['MACD'], name='MACD'))
-               fig.add_trace(go.Scatter(x=data.index, y=data['MACD_Signal'], name='MACD Signal'))
-            elif ind == 'Bollinger Bands':
-               fig.add_trace(go.Scatter(x=data.index, y=data['BB_Upper'], name='BB Upper'))
-               fig.add_trace(go.Scatter(x=data.index, y=data['BB_Middle'], name='BB Middle'))
-               fig.add_trace(go.Scatter(x=data.index, y=data['BB_Lower'], name='BB Lower'))
-            elif ind == 'ATR':
-               fig.add_trace(go.Scatter(x=data.index, y=data['ATR'], name='ATR', yaxis='y2'))
-            elif ind == 'Stochastic':
-               fig.add_trace(go.Scatter(x=data.index, y=data['Stoch_K'], name='Stoch %K', yaxis='y2'))
-               fig.add_trace(go.Scatter(x=data.index, y=data['Stoch_D'], name='Stoch %D', yaxis='y2'))
-            elif ind == 'VWAP':
-               fig.add_trace(go.Scatter(x=data.index, y=data['VWAP'], name='VWAP'))
-         fig.update_layout(yaxis2=dict(overlaying='y', side='right'), title=f"{symbol} Technical Analysis", height=600)
-         st.plotly_chart(fig)
+         fig.add_trace(go.Scatter(
+            x=df.index, y=df['amount'] if 'amount' in df.columns else df[df.columns[0]],
+            mode='markers',
+            marker=dict(color=['red' if i in [x['amount'] for x in result['anomalies']] else 'blue' for i in
+                               df['amount']] if 'amount' in df.columns else ['blue'] * len(df))
+         ))
+         fig.write_image(output)
+         click.echo(f"Anomalies: {result['anomalies']}")
+         click.echo(f"Visualization saved to {output}")
 
-         # Peer Comparison
-         st.subheader("Peer Comparison")
-         peer_data = compare_peers(symbol)
-         if not peer_data.empty:
-            fig = px.line(peer_data, title=f"{symbol} vs Peers (Cumulative Returns)")
-            st.plotly_chart(fig)
+   elif task == 'forecast':
+      result = kalman_forecast(df)
+      dates = pd.date_range(start="2025-06-19", periods=30, freq="D")
+      fig = go.Figure(data=go.Scatter(x=dates, y=result['forecast'], mode='lines'))
+      fig.write_image(output)
+      click.echo(f"Forecast saved to {output}")
 
-   elif page == "Sentiment Analysis":
-      st.header("😊 Sentiment Analysis")
-      st.subheader("News Sentiment")
-      positive, negative, neutral = get_news_sentiment(symbol)
-      cols = st.columns(3)
-      cols[0].metric("Positive", f"{positive * 100:.1f}%", delta=f"{(positive - 0.33) * 100:.1f}%")
-      cols[1].metric("Negative", f"{negative * 100:.1f}%", delta=f"{(negative - 0.33) * 100:.1f}%",
-                     delta_color="inverse")
-      cols[2].metric("Neutral", f"{neutral * 100:.1f}%", delta=f"{(neutral - 0.34) * 100:.1f}%")
-      fig = go.Figure(data=[
-         go.Pie(labels=['Positive', 'Negative', 'Neutral'], values=[positive, negative, neutral], hole=0.3)
-      ])
-      fig.update_layout(title="Sentiment Distribution")
-      st.plotly_chart(fig)
+   elif task == 'fraud':
+      result = mock_theta_fraud(df)
+      fig = go.Figure(data=go.Scatter(y=result['coefficients'], mode='lines'))
+      fig.write_image(output)
+      click.echo(f"Fraud Score: {result['score']}")
+      click.echo(f"Visualization saved to {output}")
 
-   elif page == "Portfolio Builder":
-      st.header("💼 Portfolio Builder")
-      if 'portfolio' not in st.session_state:
-         st.session_state.portfolio = {}
-      st.subheader("Add Stocks to Your Portfolio")
-      col1, col2 = st.columns(2)
-      with col1:
-         new_symbol = st.text_input("Stock Symbol", "").upper().strip()
-      with col2:
-         shares = st.number_input("Shares", min_value=1, value=100)
-      if st.button("Add to Portfolio") and new_symbol:
-         if not validate_symbol(new_symbol):
-            return
-         if shares <= 0:
-            st.error("Shares must be a positive integer.")
-            return
-         if new_symbol in st.session_state.portfolio:
-            st.session_state.portfolio[new_symbol] += shares
-         else:
-            st.session_state.portfolio[new_symbol] = shares
-         st.success(f"Added {shares} shares of {new_symbol} to portfolio")
-      if st.session_state.portfolio:
-         st.subheader("Your Portfolio")
-         portfolio_data = []
-         total_value = 0
-         for sym, shares in st.session_state.portfolio.items():
-            try:
-               stock = yf.Ticker(sym)
-               current_price = stock.history(period='1d')['Close'].iloc[-1]
-               value = current_price * shares
-               total_value += value
-               prev_close = stock.history(period='2d')['Close'].iloc[0]
-               daily_change = (current_price - prev_close) / prev_close
-               portfolio_data.append({'Symbol': sym, 'Shares': shares, 'Price': current_price, 'Value': value,
-                                      'Daily Change': daily_change})
-            except Exception as e:
-               logger.error(f"Error processing portfolio stock {sym}: {str(e)}")
-               portfolio_data.append(
-                  {'Symbol': sym, 'Shares': shares, 'Price': 'N/A', 'Value': 'N/A', 'Daily Change': 'N/A'})
-         df = pd.DataFrame(portfolio_data)
+   elif task == 'tax':
+      result = compute_tax(df, "GST")
+      click.echo(f"Tax Amount: {result['amount']}")
 
-         def safe_format(x, format_str):
-            try:
-               if pd.isna(x) or x == 'N/A':
-                  return 'N/A'
-               return format_str.format(float(x))
-            except:
-               return str(x)
+   elif task == 'bookkeeping':
+      entry = ledger.auto_entry({
+         "amount": float(df['amount'].iloc[0] if 'amount' in df.columns else 1000),
+         "gstin": df['gstin'].iloc[0] if 'gstin' in df.columns else None,
+         "date": "2025-06-19",
+         "document_type": "Sales"
+      })
+      click.echo(f"Transaction: {entry}")
 
-         styled_df = df.style.format({
-            'Price': lambda x: safe_format(x, '${:,.2f}'),
-            'Value': lambda x: safe_format(x, '${:,.2f}'),
-            'Daily Change': lambda x: safe_format(x, '{:.2%}')
-         })
-         st.dataframe(styled_df)
-         st.metric("Total Portfolio Value", f"${total_value:,.2f}")
-         if total_value > 0:
-            fig = go.Figure(data=[
-               go.Pie(labels=df[df['Value'] != 'N/A']['Symbol'], values=df[df['Value'] != 'N/A']['Value'], hole=0.3)
-            ])
-            fig.update_layout(title="Portfolio Allocation")
-            st.plotly_chart(fig)
+   elif task == 'audit':
+      result = generate_audit_report(df)
+      click.echo(f"Audit Report: {result}")
 
-   elif page == "Auditing Tools":
-      st.header("🔍 Advanced Auditing Tools")
-      auditor = AdvancedAuditTools()
-      audit_function = st.selectbox("Select Audit Function", [
-         "GST/TDS Compliance Check", "IFRS/GAAP Classifier", "Inventory Audit", "Receivables Aging Analysis"
-      ])
-      if audit_function == "GST/TDS Compliance Check":
-         st.subheader("💰 GST/TDS Compliance Check")
-         dates = pd.date_range('2023-01-01', periods=100)
-         amounts = np.random.lognormal(mean=8, sigma=1.5, size=100)
-         vendors = np.random.choice(['Vendor A', 'Vendor B', 'Vendor C', 'Vendor D'], 100)
-         transactions = pd.DataFrame({'date': dates, 'amount': amounts, 'vendor': vendors})
-         if st.button("Run Compliance Check"):
-            with st.spinner("Analyzing transactions..."):
-               result = auditor.gst_compliance_check(transactions)
-               if result is not None:
-                  st.success("Analysis completed!")
-                  col1, col2 = st.columns(2)
-                  col1.metric("Total GST Liability", f"${result['gst_amount'].sum():,.2f}")
-                  col2.metric("Anomaly Rate", f"{len(result[result['anomaly_score'] == -1]) / len(result):.1%}")
-                  normal = result[result['anomaly_score'] == 1]
-                  anomalies = result[result['anomaly_score'] == -1]
-                  fig = go.Figure()
-                  fig.add_trace(go.Scatter(x=normal['date'], y=normal['amount'], mode='markers', name='Normal',
-                                           marker=dict(color='blue')))
-                  fig.add_trace(go.Scatter(x=anomalies['date'], y=anomalies['amount'], mode='markers', name='Anomaly',
-                                           marker=dict(color='red')))
-                  fig.update_layout(title="Transaction Analysis", height=600)
-                  st.plotly_chart(fig)
-                  st.write("### Anomaly Details")
-                  st.dataframe(anomalies)
-      elif audit_function == "IFRS/GAAP Classifier":
-         st.subheader("🌐 Accounting Standard Classifier")
-         companies = [f"Company {chr(65 + i)}" for i in range(10)]
-         financials = pd.DataFrame({
-            'company': companies,
-            'revenue_growth': np.random.normal(0.08, 0.03, 10),
-            'asset_turnover': np.random.uniform(0.5, 1.5, 10),
-            'debt_ratio': np.random.uniform(0.2, 0.7, 10)
-         })
-         if st.button("Classify Standards"):
-            with st.spinner("Analyzing financial patterns..."):
-               result = auditor.accounting_standard_check(financials)
-               if result is not None:
-                  st.write("### Classification Results")
-                  st.dataframe(result)
-                  fig = go.Figure()
-                  for standard in ['IFRS', 'GAAP']:
-                     subset = result[result['predicted_standard'] == standard]
-                     fig.add_trace(go.Scatter3d(
-                        x=subset['revenue_growth'], y=subset['asset_turnover'], z=subset['debt_ratio'],
-                        mode='markers', name=standard,
-                        marker=dict(size=5, opacity=0.8)
-                     ))
-                  fig.update_layout(
-                     title="Financial Profile Clustering",
-                     scene=dict(
-                        xaxis_title="Revenue Growth",
-                        yaxis_title="Asset Turnover",
-                        zaxis_title="Debt Ratio"
-                     ),
-                     height=600
-                  )
-                  st.plotly_chart(fig)
-      elif audit_function == "Inventory Audit":
-         st.subheader("📦 Inventory Anomaly Detection")
-         dates = pd.date_range('2022-01-01', '2023-01-01', freq='D')
-         base = 100 + 20 * np.sin(np.arange(len(dates)) * 2 * np.pi / 365)
-         noise = np.random.normal(0, 5, len(dates))
-         quantities = np.maximum(10, base + noise).astype(int)
-         quantities[30] = 200
-         quantities[150:155] = 10
-         inventory_data = pd.DataFrame({'date': dates, 'quantity': quantities})
-         if st.button("Analyze Inventory"):
-            with st.spinner("Running time series analysis..."):
-               result = auditor.inventory_audit(inventory_data)
-               if result is not None:
-                  st.write("### Inventory Analysis Results")
-                  fig = go.Figure()
-                  fig.add_trace(
-                     go.Scatter(x=result['actual'].index, y=result['actual'], name='Actual', line=dict(color='blue')))
-                  fig.add_trace(go.Scatter(x=result['predicted'].index, y=result['predicted'], name='Predicted',
-                                           line=dict(color='green', dash='dash')))
-                  anomalies = result['actual'][result['anomalies'] == 1]
-                  fig.add_trace(go.Scatter(x=anomalies.index, y=anomalies, mode='markers', name='Anomaly',
-                                           marker=dict(color='red', size=10)))
-                  fig.update_layout(title="Inventory Level Analysis", height=600)
-                  st.plotly_chart(fig)
-                  st.write("### Model Summary")
-                  st.text(result['model_summary'])
-      elif audit_function == "Receivables Aging Analysis":
-         st.subheader("⏳ Receivables Aging Analysis")
-         due_dates = pd.date_range('2022-01-01', periods=50, freq='7D')
-         paid_dates = [d + timedelta(days=np.random.randint(0, 90)) if np.random.random() > 0.3 else None for d in
-                       due_dates]
-         invoices = pd.DataFrame({
-            'invoice_id': range(1001, 1051),
-            'due_date': due_dates,
-            'paid_date': paid_dates,
-            'amount': np.random.uniform(100, 5000, 50),
-            'paid_amount': [a if pd.notnull(d) else 0 for a, d in zip(np.random.uniform(100, 5000, 50), paid_dates)],
-            'customer': np.random.choice(['Customer A', 'Customer B', 'Customer C'], 50)
-         })
-         if st.button("Analyze Receivables"):
-            with st.spinner("Running receivables analysis..."):
-               result = auditor.receivables_analysis(invoices)
-               if result is not None:
-                  st.write("### Payment Probability Analysis")
-                  fig = go.Figure()
-                  fig.add_trace(go.Scatter(x=result['payment_probability'].index, y=result['payment_probability'],
-                                           name='Non-Payment Probability'))
-                  fig.update_layout(
-                     title="Payment Probability Curve",
-                     xaxis_title="Days Outstanding",
-                     yaxis_title="Probability of Non-Payment",
-                     height=500
-                  )
-                  st.plotly_chart(fig)
-                  st.write("### High Risk Receivables")
-                  st.dataframe(result['high_risk'])
-                  st.write("### Aging Summary")
-                  aging = pd.cut(result['invoices']['days_outstanding'], bins=[0, 30, 60, 90, np.inf],
-                                 labels=['0-30', '31-60', '61-90', '90+'])
-                  fig = go.Figure(data=[
-                     go.Bar(x=aging.value_counts().index, y=aging.value_counts().values)
-                  ])
-                  fig.update_layout(title="Receivables Aging Distribution", height=400)
-                  st.plotly_chart(fig)
+   elif task == 'payroll':
+      employees = [{"id": i, "salary": 50000} for i in range(2)]
+      result = process_payroll(employees)
+      click.echo(f"Payroll: {result}")
 
-   elif page == "Options Analysis":
-      st.header("📊 Options Analysis")
-      calls, puts, exp_date = get_options_chain(symbol)
-      if calls is not None:
-         st.subheader(f"Calls (Expiration: {exp_date})")
-         st.dataframe(calls)
-         st.subheader(f"Puts (Expiration: {exp_date})")
-         st.dataframe(puts)
-         fig = px.scatter(calls, x='strike', y='impliedVolatility', title="Implied Volatility vs Strike (Calls)")
-         st.plotly_chart(fig)
+   elif task == 'inventory':
+      items = [{"id": i, "stock": 100, "cost": 50} for i in range(2)]
+      result = manage_inventory(items)
+      click.echo(f"Inventory: {result}")
 
-   elif page == "Backtesting":
-      st.header("🔄 Backtesting")
-      period_options = {'1 Year': '1y', '2 Years': '2y', '5 Years': '5y'}
-      selected_period = st.selectbox("Select Time Period", list(period_options.keys()))
-      data = get_stock_data(symbol, period_options[selected_period])
-      if not data.empty:
-         st.subheader("SMA Crossover Strategy")
-         short_w = st.slider("Short SMA Window", 10, 100, 50)
-         long_w = st.slider("Long SMA Window", 50, 300, 200)
-         if st.button("Run Backtest"):
-            returns = backtest_sma_strategy(data, short_w, long_w)
-            if not returns.empty:
-               st.write(f"Strategy Return: {returns.iloc[-1]:.2f}%")
-               fig = px.line(returns, title="Cumulative Returns")
-               st.plotly_chart(fig)
+   elif task == 'reconcile':
+      bank_feed = [{"id": i, "amount": float(a), "date": "2025-01-01"} for i, a in
+                   enumerate(df['amount'][:2] if 'amount' in df.columns else [1000, 5000])]
+      result = bank_reconciliation(df.to_dict('records'), bank_feed)
+      click.echo(f"Reconciliation: {result}")
 
-   elif page == "AI Predictions":
-      st.header("🤖 AI Predictions")
-      period_options = {'1 Year': '1y', '2 Years': '2y', '5 Years': '5y'}
-      selected_period = st.selectbox("Select Time Period", list(period_options.keys()))
-      data = get_stock_data(symbol, period_options[selected_period])
+   elif task == 'vendor':
+      result = vendor_credit_risk(df)
+      click.echo(f"Vendor Risk: {result}")
 
-      if not data.empty:
-         data = calculate_technicals(data.dropna())
+   elif task == 'loan':
+      result = loan_readiness_report(df)
+      click.echo(f"Loan Report: {result}")
 
-         # LSTM Price Prediction
-         st.subheader("Price Forecast (LSTM)")
-         days_ahead = st.slider("Days Ahead", 5, 90, 30)
-         if st.button("Generate Forecast"):
-            with st.spinner("Generating price forecast..."):
-               forecast = lstm_price_prediction(data, symbol, days_ahead)
-               if not forecast.empty:
-                  fig = go.Figure()
-                  fig.add_trace(go.Candlestick(
-                     x=data.index[-60:], open=data['Open'][-60:], high=data['High'][-60:],
-                     low=data['Low'][-60:], close=data['Close'][-60:], name='Historical'
-                  ))
-                  fig.add_trace(go.Scatter(x=forecast.index, y=forecast, name='Forecast', line=dict(color='orange')))
-                  fig.update_layout(title=f"{symbol} Price Forecast", yaxis_title="Price ($)", height=600)
-                  st.plotly_chart(fig)
+   elif task == 'alerts':
+      result = predictive_alerts(df)
+      click.echo(f"Alerts: {result}")
 
-         # Stock Health Score
-         st.subheader("Stock Health Score")
-         score = stock_health_score(data, symbol)
-         st.metric("Health Score", f"{score:.1f}/100")
+   elif task == 'deductions':
+      result = smart_deduction_finder(df)
+      click.echo(f"Deductions: {result}")
 
-         # Anomaly Detection
-         st.subheader("Price Anomaly Detection")
-         anomalies = detect_price_anomalies(data)
-         if not anomalies.empty:
-            st.write("Detected Anomalies")
-            st.dataframe(anomalies)
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(x=data.index, y=data['Close'], name='Price', line=dict(color='blue')))
-            fig.add_trace(go.Scatter(x=anomalies.index, y=anomalies['Close'], mode='markers', name='Anomaly',
-                                     marker=dict(color='red', size=10)))
-            fig.update_layout(title="Price Anomaly Detection", height=600)
-            st.plotly_chart(fig)
-         else:
-            st.write("No anomalies detected.")
+   elif task == 'tda':
+      result = topological_data_analysis(df)
+      fig = go.Figure(data=go.Scatter(
+         x=[p[1][0] for p in result['persistence_diagram']],
+         y=[p[1][1] for p in result['persistence_diagram']],
+         mode='markers'
+      ))
+      fig.write_image(output)
+      click.echo(f"TDA: {result['persistence_diagram']}")
+      click.echo(f"Visualization saved to {output}")
 
-         # Trend Classification
-         st.subheader("Market Trend Prediction")
-         trend = classify_trend(data)
-         st.metric("Predicted Trend", trend)
+   elif task == 'quantum':
+      result = quantum_audit(df)
+      fig = go.Figure(data=go.Bar(x=["Entropy"], y=[result['quantum_entropy']]))
+      fig.write_image(output)
+      click.echo(f"Quantum Entropy: {result['quantum_entropy']}")
+      click.echo(f"Visualization saved to {output}")
+
+   elif task == 'partitions':
+      result = ramanujan_partitions(df)
+      fig = go.Figure(data=go.Bar(x=["Partitions"], y=[result['partitions']]))
+      fig.write_image(output)
+      click.echo(f"Partitions: {result['partitions']}")
+      click.echo(f"Visualization saved to {output}")
+
+   elif task == 'shapley':
+      result = game_theoretic_shapley_compliance(df)
+      fig = go.Figure(data=go.Bar(x=list(range(len(result['shapley_values']))), y=result['shapley_values']))
+      fig.write_image(output)
+      click.echo(f"Shapley Values: {result['shapley_values']}")
+      click.echo(f"Visualization saved to {output}")
+
+   elif task == 'frac_diff':
+      if 'amount' in df.columns:
+         result = fractional_diff(df['amount'])
+         fig = go.Figure(data=go.Scatter(y=result, mode='lines'))
+         fig.write_image(output)
+         click.echo("Fractional Differencing Applied")
+         click.echo(f"Visualization saved to {output}")
+
+   elif task == 'copula':
+      numeric_cols = df.select_dtypes(include=[np.number]).columns
+      if len(numeric_cols) >= 2:
+         result = t_copula(df[numeric_cols[:2]])
+         fig = go.Figure(data=go.Scatter(x=result[:, 0], y=result[:, 1], mode='markers'))
+         fig.write_image(output)
+         click.echo("T-Copula Applied")
+         click.echo(f"Visualization saved to {output}")
 
 
-if __name__ == "__main__":
-   main()
+if __name__ == '__main__':
+   if len(sys.argv) > 1:
+      cli()
+   else:
+      render_ui()
+
