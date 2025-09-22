@@ -10,7 +10,7 @@ env = environ.Env()
 environ.Env.read_env(os.path.join(BASE_DIR, '.env'))
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = env('SECRET_KEY')
+SECRET_KEY = env('SECRET_KEY', default='django-insecure--@*)*q0nce$=u6@$drqx5inh!tcrpoex7z(fhy4umtx6w&gya9')
 
 # Application definition
 INSTALLED_APPS = [
@@ -21,6 +21,7 @@ INSTALLED_APPS = [
     'django.contrib.messages',
     'django.contrib.staticfiles',
 
+    'rest_framework_simplejwt',
     # Third party apps
     'django_celery_results',
     'django_celery_beat',
@@ -59,6 +60,14 @@ TEMPLATES = [
 ]
 
 WSGI_APPLICATION = 'autoca.wsgi.application'
+
+REST_FRAMEWORK = {
+
+'DEFAULT_AUTHENTICATION_CLASSES': (
+
+    'rest_framework_simplejwt.authentication.JWTAuthentication',
+)
+}
 
 # Database
 DATABASES = {

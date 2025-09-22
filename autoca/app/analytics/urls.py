@@ -14,6 +14,8 @@ from .ml_views import (
 
 
 urlpatterns = [
+
+    
     path('dashboard/', AnalyticsDashboardView.as_view(), name='analytics-dashboard'),
     path('fraud-detection/<int:invoice_id>/', FraudDetectionView.as_view(), name='fraud-detection'),
     path('fraud-detection/batch/', BatchFraudAnalysisView.as_view(), name='batch-fraud-analysis'),

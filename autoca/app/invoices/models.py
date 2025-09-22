@@ -157,19 +157,28 @@ class Invoice(TimeStampedModel, SoftDeleteModel):
 
     class Meta:
         db_table = 'invoices'
-        indexes = [
-            # Composite indexes for common queries
-            models.Index(fields=['user', 'processing_status', 'uploaded_at']),
-            models.Index(fields=['user', 'fraud_risk_level', 'uploaded_at']),
-            models.Index(fields=['user', 'gst_filing_status', 'uploaded_at']),
-            models.Index(fields=['client', 'uploaded_at']),
-            models.Index(fields=['file_hash', 'user']),  # Duplicate detection
-            models.Index(fields=['uploaded_at', 'processing_status']),
-            # Partial indexes for better performance
-            models.Index(fields=['fraud_score'], condition=models.Q(fraud_score__gt=0.7)),
-            models.Index(fields=['processing_status'], condition=models.Q(processing_status='pending')),
-        ]
-        ordering = ['-uploaded_at']
+    indexes = [
+        # Composite indexes for common queries
+        models.Index(fields=['user', 'processing_status', 'uploaded_at']),
+        models.Index(fields=['user', 'fraud_risk_level', 'uploaded_at']),
+        models.Index(fields=['user', 'gst_filing_status', 'uploaded_at']),
+        models.Index(fields=['client', 'uploaded_at']),
+        models.Index(fields=['file_hash', 'user']),  # Duplicate detection
+        models.Index(fields=['uploaded_at', 'processing_status']),
+
+        # Partial indexes for better performance - MUST HAVE NAMES
+        models.Index(
+            name='high_fraud_score_idx',
+            fields=['fraud_score'],
+            condition=models.Q(fraud_score__gt=0.7)
+        ),
+        models.Index(
+            name='pending_invoices_idx',
+            fields=['processing_status'],
+            condition=models.Q(processing_status='pending')
+        ),
+    ]
+    ordering = ['-uploaded_at']
 
     def __str__(self):
         return f"Invoice {self.file_id} - {self.original_filename}"
