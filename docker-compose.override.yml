@@ -1,0 +1,29 @@
+version: '3.8'
+
+services:
+  web:
+    command: python manage.py runserver 0.0.0.0:8000
+    volumes:
+      - ./app:/app
+    env_file:
+      - .env.dev
+    ports:
+      - "8000:8000"
+
+  db:
+    env_file:
+      - .env.dev.db
+
+  celery_worker:
+    command: celery -A autoca worker -l INFO
+    volumes:
+      - ./app:/app
+    env_file:
+      - .env.dev
+
+  celery_beat:
+    command: celery -A autoca beat -l INFO
+    volumes:
+      - ./app:/app
+    env_file:
+      - .env.dev

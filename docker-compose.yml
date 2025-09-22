@@ -1,0 +1,78 @@
+
+version: '3.8'
+
+services:
+  web:
+    build: autoca/app
+    command: gunicorn autoca.wsgi:application --bind 0.0.0.0:8000
+    volumes:
+      - ./app:/app
+      - static_volume:/app/staticfiles
+      - media_volume:/app/mediafiles
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env.prod
+    depends_on:
+      - db
+      - redis
+
+  db:
+    image: postgres:15
+    volumes:
+      - postgres_data:/var/lib/postgresql/data/
+    env_file:
+      - ./.env.prod.db
+    environment:
+      - POSTGRES_DB=autoca
+      - POSTGRES_USER=autoca_user
+      - POSTGRES_PASSWORD=autoca_password
+
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - redis_data:/data
+
+
+  celery_worker_invoices:
+    build: ./app
+    command: celery -A autoca worker -l INFO -Q invoices
+    env_file: ./.env.dev
+    depends_on: [db, redis]
+
+  celery_worker_analytics:
+    build: ./app
+    command: celery -A autoca worker -l INFO -Q analytics
+    env_file: ./.env.dev
+    depends_on: [db, redis]
+
+  celery_worker_compliance:
+    build: ./app
+    command: celery -A autoca worker -l INFO -Q compliance
+    env_file: ./.env.dev
+    depends_on: [db, redis]
+
+  celery_worker_billing:
+    build: ./app
+    command: celery -A autoca worker -l INFO -Q billing
+    env_file: ./.env.dev
+    depends_on: [db, redis]
+
+  celery_worker_integrations:
+    build: ./app
+    command: celery -A autoca worker -l INFO -Q integrations
+    env_file: ./.env.dev
+    depends_on: [db, redis]
+
+  celery_worker_reports:
+    build: ./app
+    command: celery -A autoca worker -l INFO -Q reports
+    env_file: ./.env.dev
+    depends_on: [db, redis]
+
+volumes:
+  postgres_data:
+  redis_data:
+  static_volume:
+  media_volume:
+
